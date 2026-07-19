@@ -155,6 +155,24 @@ impl View {
 }
 
 impl App {
+    // Nouvelle fonction pour trouver la vue active sans la modifier
+    pub fn find_active_view(node: &SplitNode) -> Option<&View> {
+        match node {
+            SplitNode::Leaf(view) => {
+                if view.is_active {
+                    Some(view)
+                } else {
+                    None
+                }
+            }
+            SplitNode::Split { left, right, .. } => {
+                if let Some(v) = Self::find_active_view(left) {
+                    return Some(v);
+                }
+                Self::find_active_view(right)
+            }
+        }
+    }
     pub fn copy_active_view_to_clipboard(&mut self) {
         if let Some(workspace) = self.workspaces.get_mut(self.active_workspace)
             && let Some(view) = Self::find_active_view_mut(&mut workspace.root)
@@ -396,15 +414,73 @@ impl App {
         // Lancement du rendu récursif depuis la racine du workspace actif
         let root = &self.workspaces[self.active_workspace].root;
         self.draw_node(root, area, &mut stdout)?;
-        if self.is_searching {
+        if self.is_searching || !self.search_query.is_empty() {
+            let mut match_count = 0;
+            let mut valid_regex = true;
+
+            // 1. Calcul des occurrences
+            if !self.search_query.is_empty() {
+                match Regex::new(&self.search_query) {
+                    Ok(re) => {
+                        // On récupère le texte du panneau actif
+                        if let Some(workspace) = self.workspaces.get(self.active_workspace)
+                            && let Some(view) = Self::find_active_view(&workspace.root)
+                            && let Some(hash) = view.get_active_tab_hash()
+                            && let Some(buffer) = self.buffers.get(hash)
+                        {
+                            // On compte les correspondances sur chaque ligne
+                            for line in &buffer.lines {
+                                match_count += re.find_iter(line).count();
+                            }
+                        }
+                    }
+                    Err(_) => valid_regex = false, // Si on est en train de taper un truc invalide (ex: "[a-")
+                }
+            }
+
+            // 2. Affichage de la requête à gauche
             queue!(
                 stdout,
                 crossterm::cursor::MoveTo(0, rows.saturating_sub(1)), // Tout en bas
                 SetBackgroundColor(Color::Black),
+                Clear(ClearType::CurrentLine), // Nettoie la ligne pour éviter les résidus
                 SetForegroundColor(Color::White),
                 Print(format!("/{}", self.search_query)),
-                ResetColor
             )?;
+
+            // 3. Affichage du compteur à droite
+            if !self.search_query.is_empty() {
+                // On prépare le texte
+                let count_str = if !valid_regex {
+                    "[Invalid regex]".to_string()
+                } else if match_count == 0 {
+                    "[No results]".to_string()
+                } else {
+                    format!(
+                        "[{} occurrence{}]",
+                        match_count,
+                        if match_count > 1 { "s" } else { "" }
+                    )
+                };
+                // On prépare la couleur
+                let count_color = if !valid_regex || match_count == 0 {
+                    Color::Red
+                } else {
+                    Color::Green
+                };
+
+                // On calcule la position X pour l'aligner à droite
+                let x_pos = cols.saturating_sub(count_str.len() as u16);
+
+                queue!(
+                    stdout,
+                    crossterm::cursor::MoveTo(x_pos, rows.saturating_sub(1)),
+                    SetForegroundColor(count_color),
+                    Print(count_str),
+                )?;
+            }
+
+            queue!(stdout, ResetColor)?;
         }
         stdout.flush()
     }
