@@ -1,14 +1,16 @@
 use crate::{app::buffer::Buffer, crypto::hash};
+use crossterm::event::poll;
 use crossterm::style::SetBackgroundColor;
 use crossterm::terminal::LeaveAlternateScreen;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, KeyCode, KeyModifiers},
     execute, queue,
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{Clear, ClearType, EnterAlternateScreen, enable_raw_mode, size},
 };
 use regex::Regex;
 use std::io::{IsTerminal, Read, stdin};
+use std::time::{Duration, SystemTime};
 use std::{
     collections::HashMap,
     fs::{File, create_dir_all, read_to_string},
@@ -449,7 +451,6 @@ impl App {
                     } else {
                         None
                     };
-
                     for (i, line) in visible_lines.enumerate() {
                         queue!(
                             stdout,
@@ -457,7 +458,27 @@ impl App {
                         )?;
                         let truncated: String = line.chars().take(area.width as usize).collect();
 
-                        // --- NOUVEAU : Application de la coloration ---
+                        // --- DÉTECTION DU MODE DIFF ---
+                        // On analyse le début de la ligne pour déterminer sa couleur
+                        let base_color =
+                            if truncated.starts_with("+++") || truncated.starts_with("---") {
+                                Color::White // En-têtes de fichiers souvent en blanc/gras
+                            } else if truncated.starts_with('+') {
+                                Color::Green // Ajouts en vert
+                            } else if truncated.starts_with('-') {
+                                Color::Red // Suppressions en rouge
+                            } else if truncated.starts_with("@@") {
+                                Color::Cyan // Indicateurs de blocs en cyan
+                            } else {
+                                Color::Reset // Texte normal
+                            };
+
+                        // On applique la couleur de base avant de dessiner la ligne
+                        if base_color != Color::Reset {
+                            queue!(stdout, SetForegroundColor(base_color))?;
+                        }
+
+                        // --- APPLICATION DE LA RECHERCHE ET DU RENDU ---
                         if let Some(re) = &search_re {
                             let mut last_end = 0;
                             // On cherche tous les morceaux qui correspondent
@@ -465,31 +486,39 @@ impl App {
                                 let start = mat.start();
                                 let end = mat.end();
 
-                                // 1. Imprimer le texte normal avant le match
+                                // 1. Imprimer le texte normal avant le match (gardera la couleur de diff)
                                 if start > last_end {
                                     queue!(stdout, Print(&truncated[last_end..start]))?;
                                 }
 
-                                // 2. Imprimer le match en surbrillance (ex: Noir sur fond Jaune)
+                                // 2. Imprimer le match en surbrillance (Noir sur fond Blanc)
                                 queue!(
                                     stdout,
                                     SetForegroundColor(Color::Black),
                                     SetBackgroundColor(Color::White),
                                     Print(&truncated[start..end]),
-                                    ResetColor
+                                    ResetColor // ATTENTION : efface toutes les couleurs
                                 )?;
+
+                                // 3. RESTAURATION : On remet la couleur du diff pour la suite de la ligne
+                                if base_color != Color::Reset {
+                                    queue!(stdout, SetForegroundColor(base_color))?;
+                                }
 
                                 last_end = end;
                             }
 
-                            // 3. Imprimer le reste de la ligne s'il y en a
+                            // 4. Imprimer le reste de la ligne s'il y en a
                             if last_end < truncated.len() {
                                 queue!(stdout, Print(&truncated[last_end..]))?;
                             }
                         } else {
                             // Comportement normal si pas de recherche
-                            queue!(stdout, Print(truncated))?;
+                            queue!(stdout, Print(&truncated))?;
                         }
+
+                        // Sécurité finale : on s'assure de toujours réinitialiser la couleur à la fin de la ligne
+                        queue!(stdout, ResetColor)?;
                     }
                 }
             }
@@ -610,16 +639,24 @@ impl App {
             .to_string();
         let h = hash(file);
         let _ = create_dir_all("/tmp/dwx");
+        
+        // Récupère le timestamp de modification du fichier
+        let last_modified = std::fs::metadata(file)
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        
         self.buffers.insert(
             h.clone(),
             Buffer {
                 original_name: name.to_string(),
+                original_path: file.clone(),
                 temp_path: PathBuf::from(format!("/tmp/dwx/{h}")),
                 lines: read_to_string(file)
                     .expect("failed to get content")
                     .lines()
                     .map(|s| s.to_string())
                     .collect::<Vec<String>>(),
+                last_modified,
             },
         );
         self
@@ -734,6 +771,8 @@ impl App {
     pub fn run(&mut self) -> ExitCode {
         let mut stdout = stdout();
 
+        enable_raw_mode().expect("Raw mode");
+        execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide).ok();
         // --- 1. PRISE DE CONTRÔLE DU TERMINAL ---
         // On active le mode brut (les touches sont lues instantanément)
         enable_raw_mode().expect("Échec de l'activation du mode brut");
@@ -743,128 +782,101 @@ impl App {
 
         // --- 2. BOUCLE PRINCIPALE ---
         loop {
-            // On affiche l'interface (la fonction draw que nous avons conceptualisée)
+            // A. Rendu de l'interface
             self.draw().expect("Erreur de rendu");
 
-            // On se met en pause jusqu'à ce qu'un événement survienne
-            if let Ok(Event::Key(key)) = event::read() {
-                // Sécurité : On ne réagit qu'à l'appui de la touche (évite les doubles déclenchements)
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                if self.is_searching {
-                    match key.code {
-                        KeyCode::Esc => {
-                            self.is_searching = false; // Annuler la recherche
+            // C. Gestion du Watcher (Non-bloquant) - AVANT les événements clavier
+            // On traite les modifications de fichiers indépendamment
+            // C. Polling des fichiers pour détecter les modifications
+            for (_, buffer) in self.buffers.iter_mut() {
+                if let Ok(metadata) = std::fs::metadata(&buffer.original_path) {
+                    if let Ok(modified) = metadata.modified() {
+                        if modified > buffer.last_modified {
+                            // Le fichier a été modifié, on le recharge
+                            if let Ok(new_content) = std::fs::read_to_string(&buffer.original_path) {
+                                buffer.lines =
+                                    new_content.lines().map(|s| s.to_string()).collect();
+                                buffer.last_modified = modified;
+                            }
                         }
+                    }
+                }
+            }
+
+            // B. Gestion des événements clavier
+            if poll(Duration::from_millis(10)).expect("msg")
+                && let Ok(event) = event::read()
+                && let Some(e) = event.as_key_event()
+            {
+                if self.is_searching {
+                    match e.code {
+                        KeyCode::Esc => self.is_searching = false,
                         KeyCode::Enter => {
                             self.search_next();
                             self.is_searching = false;
                         }
                         KeyCode::Backspace => {
-                            self.search_query.pop(); // Effacer le dernier caractère
+                            self.search_query.pop();
                         }
                         KeyCode::Char(c) => {
-                            self.search_query.push(c); // Ajouter le caractère tapé
+                            self.search_query.push(c);
                         }
                         _ => {}
                     }
-                    continue; // On passe au rafraîchissement de l'écran
-                } else if self.window_mode {
-                    match key.code {
-                        // 'v' pour Vertical split
-                        KeyCode::Char('v') => {
-                            self.split_active_view(SplitDirection::Vertical);
-                        }
-                        KeyCode::Tab => {
-                            self.cycle_focus();
-                        }
-                        // 'h' pour Horizontal split
-                        KeyCode::Char('h') => {
-                            self.split_active_view(SplitDirection::Horizontal);
-                        }
-                        KeyCode::Char('q') => {
-                            self.close_active_view();
-                        }
-                        // Annuler le mode fenêtre avec Esc ou n'importe quelle autre touche
-                        KeyCode::Esc => {
-                            self.window_mode = false;
-                        }
-                        _ => {
-                            // Si l'utilisateur se trompe de touche, on annule par sécurité
-                        }
+                }
+                // Logique Mode Fenêtre (window_mode)
+                else if self.window_mode {
+                    match e.code {
+                        KeyCode::Char('v') => self.split_active_view(SplitDirection::Vertical),
+                        KeyCode::Char('h') => self.split_active_view(SplitDirection::Horizontal),
+                        KeyCode::Tab => self.cycle_focus(),
+                        KeyCode::Char('q') => self.close_active_view(),
+                        KeyCode::Esc => self.window_mode = false,
+                        _ => {}
                     }
-                    continue; // On passe à l'itération suivante pour redessiner
-                } else {
-                    match key.code {
+                }
+                // Logique standard
+                else {
+                    match e.code {
                         KeyCode::Char('/') => {
                             self.is_searching = true;
-                            self.search_query.clear(); // On vide l'ancienne recherche
+                            self.search_query.clear();
                         }
-                        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            self.window_mode = true;
+                        KeyCode::Char('w')
+                            if event
+                                .as_key_event()
+                                .expect("msg")
+                                .modifiers
+                                .contains(KeyModifiers::CONTROL) =>
+                        {
+                            self.window_mode = true
                         }
-                        KeyCode::PageDown => {
-                            self.next_workspace();
-                        }
-                        KeyCode::PageUp => {
-                            self.previous_workspace();
-                        }
-                        KeyCode::Char('>') => {
-                            self.adjust_active_ratio(0.05);
-                        }
-
-                        // Réduire la vue active
-                        KeyCode::Char('<') => {
-                            self.adjust_active_ratio(-0.05);
-                        }
-                        // --- Accès direct aux Workspaces (Touches 1 à 9) ---
+                        KeyCode::PageDown => self.next_workspace(),
+                        KeyCode::PageUp => self.previous_workspace(),
+                        KeyCode::Char('>') => self.adjust_active_ratio(0.05),
+                        KeyCode::Char('<') => self.adjust_active_ratio(-0.05),
                         KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                            // On convertit le caractère '1'..'9' en index usize 0..8
                             if let Some(digit) = c.to_digit(10) {
-                                let index = (digit - 1) as usize;
-                                self.go_to_workspace(index);
+                                self.go_to_workspace((digit - 1) as usize);
                             }
                         }
-                        // --- Quitter l'application ---
                         KeyCode::Esc => {
                             self.cleanup_temp_files();
                             break;
                         }
-                        KeyCode::Char('n') => {
-                            self.search_next();
-                        }
-                        KeyCode::Char('N') => {
-                            self.search_previous();
-                        }
-                        // --- Documentation / Aide ---
-                        KeyCode::F(1) => {
-                            // TODO: Implémenter l'affichage de l'aide/doc
-                            // Par exemple : charger un Buffer spécial "Help" et le mettre en focus
-                        }
-                        KeyCode::F(2) => {
-                            self.show_filenames = !self.show_filenames;
-                        }
-                        // --- Navigation des onglets (Tabs) ---
-                        KeyCode::Tab | KeyCode::Right => {
-                            self.next_tab_action();
-                        }
-                        KeyCode::BackTab | KeyCode::Left => {
-                            self.previous_tab_action();
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            self.scroll_up();
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            self.scroll_down();
-                        }
+                        KeyCode::Char('n') => self.search_next(),
+                        KeyCode::Char('N') => self.search_previous(),
+                        KeyCode::F(2) => self.show_filenames = !self.show_filenames,
+                        KeyCode::Tab | KeyCode::Right => self.next_tab_action(),
+                        KeyCode::BackTab | KeyCode::Left => self.previous_tab_action(),
+                        KeyCode::Up | KeyCode::Char('k') => self.scroll_up(),
+                        KeyCode::Down | KeyCode::Char('j') => self.scroll_down(),
                         _ => {}
                     }
                 }
             }
         }
 
-        // --- 3. RESTAURATION DU TERMINAL ---
         // Cette étape est vitale pour rendre le terminal à l'utilisateur dans un état propre
         execute!(stdout, LeaveAlternateScreen, crossterm::cursor::Show,)
             .expect("Échec de la restauration de l'écran");

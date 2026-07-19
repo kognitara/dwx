@@ -8,10 +8,9 @@ mod ui;
 mod ux;
 mod views;
 mod workspaces;
-use std::path::PathBuf;
-
 use crate::app::App;
 use clap::Parser;
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
