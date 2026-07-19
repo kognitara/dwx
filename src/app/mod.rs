@@ -22,7 +22,7 @@ use std::{
     io::{Write, stdout},
 };
 pub mod buffer;
-
+use similar::{ChangeTag, TextDiff};
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Rect {
     pub x: u16,
@@ -101,6 +101,7 @@ pub struct App {
     /// L'index du workspace actuellement affiché
     pub active_workspace: usize,
     pub window_mode: bool,
+    pub is_diff_mode: bool,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -220,7 +221,6 @@ impl App {
             }
         }
     }
-
     pub fn cycle_focus(&mut self) {
         if let Some(workspace) = self.workspaces.get_mut(self.active_workspace) {
             let mut view_count = 0;
@@ -434,92 +434,136 @@ impl App {
                     }
                     x_offset += text.len() as u16 + 1;
                 }
-                if let Some(buffer) = self
-                    .buffers
-                    .get(view.get_active_tab_hash().unwrap_or(&"".to_string()))
-                {
-                    let content_height = area.height.saturating_sub(1) as usize;
-                    let visible_lines = buffer
-                        .lines
-                        .iter()
-                        .skip(view.scroll_offset)
-                        .take(content_height);
 
-                    // --- NOUVEAU : On prépare la regex si on est en train de chercher ---
-                    let search_re = if !self.search_query.is_empty() {
-                        Regex::new(&self.search_query).ok() // Si c'est invalide, on ignore
-                    } else {
-                        None
-                    };
-                    for (i, line) in visible_lines.enumerate() {
-                        queue!(
-                            stdout,
-                            crossterm::cursor::MoveTo(area.x, area.y + 1 + i as u16)
-                        )?;
-                        let truncated: String = line.chars().take(area.width as usize).collect();
+                // 2. PRÉPARATION DU CONTENU (Side-by-Side Diff ou Normal)
+                let content_height = area.height.saturating_sub(1) as usize;
+                let mut rendered_lines: Vec<(String, Color)> = Vec::new();
+                let mut is_diff_rendered = false;
 
-                        // --- DÉTECTION DU MODE DIFF ---
-                        // On analyse le début de la ligne pour déterminer sa couleur
-                        let base_color =
-                            if truncated.starts_with("+++") || truncated.starts_with("---") {
-                                Color::White // En-têtes de fichiers souvent en blanc/gras
-                            } else if truncated.starts_with('+') {
-                                Color::Green // Ajouts en vert
-                            } else if truncated.starts_with('-') {
-                                Color::Red // Suppressions en rouge
-                            } else if truncated.starts_with("@@") {
-                                Color::Cyan // Indicateurs de blocs en cyan
-                            } else {
-                                Color::Reset // Texte normal
-                            };
+                if self.is_diff_mode {
+                    if let Some((b1, b2)) = self.get_diff_buffers() {
+                        let current_hash = view.get_active_tab_hash();
 
-                        // On applique la couleur de base avant de dessiner la ligne
-                        if base_color != Color::Reset {
-                            queue!(stdout, SetForegroundColor(base_color))?;
-                        }
+                        // On identifie les deux volets principaux
+                        let mut views = Vec::new();
+                        Self::collect_views(
+                            &self.workspaces[self.active_workspace].root,
+                            &mut views,
+                        );
 
-                        // --- APPLICATION DE LA RECHERCHE ET DU RENDU ---
-                        if let Some(re) = &search_re {
-                            let mut last_end = 0;
-                            // On cherche tous les morceaux qui correspondent
-                            for mat in re.find_iter(&truncated) {
-                                let start = mat.start();
-                                let end = mat.end();
+                        let hash_left = views.get(0).and_then(|v| v.get_active_tab_hash());
+                        let hash_right = views.get(1).and_then(|v| v.get_active_tab_hash());
 
-                                // 1. Imprimer le texte normal avant le match (gardera la couleur de diff)
-                                if start > last_end {
-                                    queue!(stdout, Print(&truncated[last_end..start]))?;
+                        let is_left = current_hash == hash_left;
+                        let is_right = current_hash == hash_right;
+
+                        // Si la vue courante fait partie du diff, on calcule et on aligne
+                        if is_left || is_right {
+                            is_diff_rendered = true;
+                            let t1 = b1.lines.join("\n");
+                            let t2 = b2.lines.join("\n");
+                            let diff = TextDiff::from_lines(&t1, &t2);
+
+                            for change in diff.iter_all_changes() {
+                                // On nettoie les retours à la ligne pour le rendu
+                                let val = change
+                                    .value()
+                                    .trim_end_matches(|c| c == '\n' || c == '\r')
+                                    .to_string();
+
+                                match change.tag() {
+                                    ChangeTag::Equal => rendered_lines.push((val, Color::Reset)),
+                                    ChangeTag::Delete => {
+                                        if is_left {
+                                            rendered_lines.push((val, Color::Red));
+                                        } else {
+                                            rendered_lines.push(("".to_string(), Color::Reset)); // Ligne vide d'alignement
+                                        }
+                                    }
+                                    ChangeTag::Insert => {
+                                        if is_left {
+                                            rendered_lines.push(("".to_string(), Color::Reset)); // Ligne vide d'alignement
+                                        } else {
+                                            rendered_lines.push((val, Color::Green));
+                                        }
+                                    }
                                 }
-
-                                // 2. Imprimer le match en surbrillance (Noir sur fond Blanc)
-                                queue!(
-                                    stdout,
-                                    SetForegroundColor(Color::Black),
-                                    SetBackgroundColor(Color::White),
-                                    Print(&truncated[start..end]),
-                                    ResetColor // ATTENTION : efface toutes les couleurs
-                                )?;
-
-                                // 3. RESTAURATION : On remet la couleur du diff pour la suite de la ligne
-                                if base_color != Color::Reset {
-                                    queue!(stdout, SetForegroundColor(base_color))?;
-                                }
-
-                                last_end = end;
                             }
-
-                            // 4. Imprimer le reste de la ligne s'il y en a
-                            if last_end < truncated.len() {
-                                queue!(stdout, Print(&truncated[last_end..]))?;
-                            }
-                        } else {
-                            // Comportement normal si pas de recherche
-                            queue!(stdout, Print(&truncated))?;
                         }
-
-                        // Sécurité finale : on s'assure de toujours réinitialiser la couleur à la fin de la ligne
-                        queue!(stdout, ResetColor)?;
                     }
+                }
+
+                // Si le mode diff est désactivé ou qu'on n'a pas 2 volets valides, comportement normal
+                if !is_diff_rendered {
+                    if let Some(buffer) = self
+                        .buffers
+                        .get(view.get_active_tab_hash().unwrap_or(&"".to_string()))
+                    {
+                        for line in &buffer.lines {
+                            rendered_lines.push((line.clone(), Color::Reset));
+                        }
+                    }
+                }
+
+                // 3. RENDU DES LIGNES (Avec coloration et recherche)
+                let search_re = if !self.search_query.is_empty() {
+                    Regex::new(&self.search_query).ok()
+                } else {
+                    None
+                };
+
+                let visible_lines = rendered_lines
+                    .iter()
+                    .skip(view.scroll_offset)
+                    .take(content_height);
+
+                for (i, (line, base_color)) in visible_lines.enumerate() {
+                    queue!(
+                        stdout,
+                        crossterm::cursor::MoveTo(area.x, area.y + 1 + i as u16)
+                    )?;
+                    let truncated: String = line.chars().take(area.width as usize).collect();
+
+                    if *base_color != Color::Reset {
+                        queue!(stdout, SetForegroundColor(*base_color))?;
+                    }
+
+                    if let Some(re) = &search_re {
+                        let mut last_end = 0;
+                        for mat in re.find_iter(&truncated) {
+                            let start = mat.start();
+                            let end = mat.end();
+
+                            if start > last_end {
+                                queue!(stdout, Print(&truncated[last_end..start]))?;
+                            }
+
+                            // Surlignage de la recherche
+                            queue!(
+                                stdout,
+                                SetForegroundColor(Color::Black),
+                                SetBackgroundColor(Color::White),
+                                Print(&truncated[start..end]),
+                                ResetColor
+                            )?;
+
+                            // Restauration de la couleur du diff
+                            if *base_color != Color::Reset {
+                                queue!(stdout, SetForegroundColor(*base_color))?;
+                            }
+
+                            last_end = end;
+                        }
+
+                        if last_end < truncated.len() {
+                            queue!(stdout, Print(&truncated[last_end..]))?;
+                        }
+                    } else {
+                        queue!(stdout, Print(&truncated))?;
+                    }
+
+                    // Sécurité
+                    queue!(stdout, ResetColor)?;
                 }
             }
             SplitNode::Split {
@@ -536,21 +580,35 @@ impl App {
         }
         Ok(())
     }
-    pub fn get_active_buffer(&self) -> Option<&Buffer> {
+
+    /// Récupère les deux buffers si le workspace est divisé en deux panes
+    pub fn get_diff_buffers(&self) -> Option<(&Buffer, &Buffer)> {
         let workspace = self.workspaces.get(self.active_workspace)?;
 
-        // On cherche la première Leaf (vue) disponible dans l'arbre
-        let view = Self::find_first_view(&workspace.root)?;
+        // On a besoin d'une fonction pour extraire les deux feuilles d'un split
+        // Si ton arbre est complexe, on se contente de chercher les deux premières feuilles
+        let mut views = Vec::new();
+        Self::collect_views(&workspace.root, &mut views);
 
-        let active_hash = view.get_active_tab_hash()?;
-        self.buffers.get(active_hash)
+        if views.len() >= 2 {
+            let hash1 = views[0].get_active_tab_hash()?;
+            let hash2 = views[1].get_active_tab_hash()?;
+
+            return Some((self.buffers.get(hash1)?, self.buffers.get(hash2)?));
+        }
+        None
     }
-    fn find_first_view(node: &SplitNode) -> Option<&View> {
+
+    fn collect_views<'a>(node: &'a SplitNode, views: &mut Vec<&'a View>) {
         match node {
-            SplitNode::Leaf(view) => Some(view),
-            SplitNode::Split { left, .. } => Self::find_first_view(left),
+            SplitNode::Leaf(view) => views.push(view),
+            SplitNode::Split { left, right, .. } => {
+                Self::collect_views(left, views);
+                Self::collect_views(right, views);
+            }
         }
     }
+
     pub fn close_active_view(&mut self) {
         if let Some(workspace) = self.workspaces.get_mut(self.active_workspace) {
             // On extrait l'arbre actuel pour le manipuler
@@ -639,12 +697,12 @@ impl App {
             .to_string();
         let h = hash(file);
         let _ = create_dir_all("/tmp/dwx");
-        
+
         // Récupère le timestamp de modification du fichier
         let last_modified = std::fs::metadata(file)
             .and_then(|m| m.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        
+
         self.buffers.insert(
             h.clone(),
             Buffer {
@@ -661,22 +719,57 @@ impl App {
         );
         self
     }
+
+    fn collect_views_mut<'a>(node: &'a mut SplitNode, views: &mut Vec<&'a mut View>) {
+        match node {
+            SplitNode::Leaf(view) => views.push(view),
+            SplitNode::Split { left, right, .. } => {
+                Self::collect_views_mut(left, views);
+                Self::collect_views_mut(right, views);
+            }
+        }
+    }
     pub fn scroll_up(&mut self) {
-        if let Some(workspace) = self.workspaces.get_mut(self.active_workspace)
-            && let Some(view) = Self::find_active_view_mut(&mut workspace.root)
-        {
-            view.scroll_offset = view.scroll_offset.saturating_sub(1);
+        if let Some(workspace) = self.workspaces.get_mut(self.active_workspace) {
+            if self.is_diff_mode {
+                // Mode Diff : On récupère les vues mutables et on fait défiler les deux premières
+                let mut views = Vec::new();
+                Self::collect_views_mut(&mut workspace.root, &mut views);
+
+                for view in views.into_iter().take(2) {
+                    view.scroll_offset = view.scroll_offset.saturating_sub(1);
+                }
+            } else if let Some(view) = Self::find_active_view_mut(&mut workspace.root) {
+                // Mode normal : On ne fait défiler que la vue active
+                view.scroll_offset = view.scroll_offset.saturating_sub(1);
+            }
         }
     }
 
     pub fn scroll_down(&mut self) {
-        let max_lines = self.get_active_buffer().map(|b| b.lines.len()).unwrap_or(0);
+        if let Some(workspace) = self.workspaces.get_mut(self.active_workspace) {
+            if self.is_diff_mode {
+                // Mode Diff : Défilement synchronisé des deux panneaux vers le bas
+                let mut views = Vec::new();
+                Self::collect_views_mut(&mut workspace.root, &mut views);
 
-        if let Some(workspace) = self.workspaces.get_mut(self.active_workspace)
-            && let Some(view) = Self::find_active_view_mut(&mut workspace.root)
-            && view.scroll_offset + 1 < max_lines
-        {
-            view.scroll_offset += 1;
+                // Pour faire propre, on devrait idéalement vérifier la limite max de chaque buffer,
+                // mais pour commencer on peut forcer l'incrémentation des deux
+                for view in views.into_iter().take(2) {
+                    view.scroll_offset += 1;
+                }
+            } else if let Some(view) = Self::find_active_view_mut(&mut workspace.root) {
+                // Mode normal : Ta logique d'origine avec la vérification de la taille max
+                let max_lines = self
+                    .buffers
+                    .get(view.get_active_tab_hash().unwrap_or(&String::new()))
+                    .map(|b| b.lines.len())
+                    .unwrap_or(0);
+
+                if view.scroll_offset + 1 < max_lines {
+                    view.scroll_offset += 1;
+                }
+            }
         }
     }
 
@@ -779,24 +872,25 @@ impl App {
         // On passe sur l'écran alternatif et on cache le curseur
         execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide)
             .expect("Échec de la transition vers l'écran alternatif");
-
+        let mut needs_redraw = true;
         // --- 2. BOUCLE PRINCIPALE ---
         loop {
             // A. Rendu de l'interface
-            self.draw().expect("Erreur de rendu");
-
-            // C. Gestion du Watcher (Non-bloquant) - AVANT les événements clavier
-            // On traite les modifications de fichiers indépendamment
-            // C. Polling des fichiers pour détecter les modifications
+            if needs_redraw {
+                self.draw().expect("Erreur de rendu");
+                needs_redraw = false; // On baisse le drapeau une fois l'écran mis à jour
+            }
             for (_, buffer) in self.buffers.iter_mut() {
                 if let Ok(metadata) = std::fs::metadata(&buffer.original_path) {
                     if let Ok(modified) = metadata.modified() {
                         if modified > buffer.last_modified {
-                            // Le fichier a été modifié, on le recharge
-                            if let Ok(new_content) = std::fs::read_to_string(&buffer.original_path) {
-                                buffer.lines =
-                                    new_content.lines().map(|s| s.to_string()).collect();
+                            if let Ok(new_content) = std::fs::read_to_string(&buffer.original_path)
+                            {
+                                buffer.lines = new_content.lines().map(|s| s.to_string()).collect();
                                 buffer.last_modified = modified;
+
+                                // NOUVEAU : Le fichier a été modifié, on demande un rafraîchissement
+                                needs_redraw = true;
                             }
                         }
                     }
@@ -808,6 +902,7 @@ impl App {
                 && let Ok(event) = event::read()
                 && let Some(e) = event.as_key_event()
             {
+                needs_redraw = true;
                 if self.is_searching {
                     match e.code {
                         KeyCode::Esc => self.is_searching = false,
@@ -841,6 +936,33 @@ impl App {
                         KeyCode::Char('/') => {
                             self.is_searching = true;
                             self.search_query.clear();
+                        }
+                        KeyCode::Char('d') => {
+                            self.is_diff_mode = !self.is_diff_mode;
+
+                            // L'Auto-Split magique :
+                            // Si on active le diff mais qu'on a qu'une seule vue, on prépare le terrain
+                            if self.is_diff_mode {
+                                let mut view_count = 0;
+                                let mut active_idx = None;
+
+                                // On compte combien de panneaux sont actuellement ouverts
+                                if let Some(workspace) = self.workspaces.get(self.active_workspace)
+                                {
+                                    Self::find_active_idx(
+                                        &workspace.root,
+                                        &mut view_count,
+                                        &mut active_idx,
+                                    );
+                                }
+
+                                // S'il n'y a qu'un seul panneau, on automatise la mise en page
+                                if view_count < 2 {
+                                    self.split_active_view(SplitDirection::Vertical); // 1. Coupe en deux
+                                    self.cycle_focus(); // 2. Saute sur la vue de droite
+                                    self.next_tab_action(); // 3. Affiche le fichier suivant
+                                }
+                            }
                         }
                         KeyCode::Char('w')
                             if event
