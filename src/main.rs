@@ -51,8 +51,6 @@ fn main() {
             }
         }
     }
-    dbg!(&app);
-
     // 5. Go !
     app.make().run();
 }
