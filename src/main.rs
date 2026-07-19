@@ -34,9 +34,9 @@ fn main() {
     app.add_stdin();
 
     // 3. On traite les fichiers s'ils ont été fournis en arguments
-    for path in cli.files {
+    for path in &cli.files {
         if path.is_file() {
-            app.add_file(&path);
+            app.add_file(path);
         }
     }
 
@@ -45,10 +45,14 @@ fn main() {
     if let Some(workspace) = app.workspaces.get_mut(0)
         && let Some(view) = App::find_active_view_mut(&mut workspace.root)
     {
-        for hash in hashes {
-            view.tabs.push(hash);
+        for hash in &hashes {
+            if view.tabs.contains(hash).eq(&false) {
+                view.tabs.push(hash.to_string());
+            }
         }
     }
+    dbg!(&app);
+
     // 5. Go !
     app.make().run();
 }

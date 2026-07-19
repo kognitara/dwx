@@ -24,6 +24,7 @@ use std::{
 };
 pub mod buffer;
 use similar::{ChangeTag, TextDiff};
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Rect {
     pub x: u16,
@@ -119,6 +120,7 @@ pub struct View {
     pub scroll_offset: usize,
     pub is_active: bool,
     pub scroll_x: usize,
+    pub is_rotated: bool,
 }
 impl Default for View {
     fn default() -> Self {
@@ -127,7 +129,8 @@ impl Default for View {
             active_tab: 0,
             scroll_offset: 0,
             is_active: true,
-            scroll_x: 0, // La première vue a toujours le focus par défaut
+            scroll_x: 0,
+            is_rotated: false, // La première vue a toujours le focus par défaut
         }
     }
 }
@@ -157,21 +160,104 @@ impl View {
 }
 
 impl App {
+    pub fn toggle_layout(&mut self) {
+        if let Some(workspace) = self.workspaces.get_mut(self.active_workspace) {
+            Self::recursive_toggle_direction(&mut workspace.root);
+        }
+    }
+
+    fn recursive_toggle_direction(node: &mut SplitNode) {
+        match node {
+            SplitNode::Split {
+                direction,
+                left,
+                right,
+                ..
+            } => {
+                // On inverse la direction du split actuel
+                *direction = match direction {
+                    SplitDirection::Vertical => SplitDirection::Horizontal,
+                    SplitDirection::Horizontal => SplitDirection::Vertical,
+                };
+
+                // On propage le changement à toutes les sous-fenêtres
+                Self::recursive_toggle_direction(left);
+                Self::recursive_toggle_direction(right);
+            }
+            SplitNode::Leaf(_) => {} // Si c'est une vue finale, on ne fait rien
+        }
+    }
+    pub fn scroll_up(&mut self) {
+        if let Some(workspace) = self.workspaces.get_mut(self.active_workspace) {
+            if self.is_diff_mode {
+                let mut views = Vec::new();
+                Self::collect_views_mut(&mut workspace.root, &mut views);
+                for view in views.into_iter().take(2) {
+                    if view.is_rotated {
+                        view.scroll_x = view.scroll_x.saturating_sub(1); // Haut = Gauche
+                    } else {
+                        view.scroll_offset = view.scroll_offset.saturating_sub(1);
+                    }
+                }
+            } else if let Some(view) = Self::find_active_view_mut(&mut workspace.root) {
+                if view.is_rotated {
+                    view.scroll_x = view.scroll_x.saturating_sub(1); // Haut = Gauche
+                } else {
+                    view.scroll_offset = view.scroll_offset.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    pub fn scroll_down(&mut self) {
+        if let Some(workspace) = self.workspaces.get_mut(self.active_workspace) {
+            if self.is_diff_mode {
+                let mut views = Vec::new();
+                Self::collect_views_mut(&mut workspace.root, &mut views);
+                for view in views.into_iter().take(2) {
+                    if view.is_rotated {
+                        view.scroll_x += 1; // Bas = Droite
+                    } else {
+                        view.scroll_offset += 1;
+                    }
+                }
+            } else if let Some(view) = Self::find_active_view_mut(&mut workspace.root) {
+                if view.is_rotated {
+                    view.scroll_x += 1; // Bas = Droite
+                } else {
+                    let max_lines = self
+                        .buffers
+                        .get(view.get_active_tab_hash().unwrap_or(&String::new()))
+                        .map(|b| b.lines.len())
+                        .unwrap_or(0);
+
+                    if view.scroll_offset + 1 < max_lines {
+                        view.scroll_offset += 1;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn scroll_left(&mut self) {
         if let Some(workspace) = self.workspaces.get_mut(self.active_workspace)
             && let Some(view) = Self::find_active_view_mut(&mut workspace.root)
+            && view.is_rotated
         {
-            view.scroll_x = view.scroll_x.saturating_sub(1);
+            view.scroll_offset = view.scroll_offset.saturating_sub(1); // Gauche = Haut
         }
     }
 
     pub fn scroll_right(&mut self) {
         if let Some(workspace) = self.workspaces.get_mut(self.active_workspace)
             && let Some(view) = Self::find_active_view_mut(&mut workspace.root)
+            && view.is_rotated
         {
-            view.scroll_x += 1;
+            // Idéalement, on vérifierait max_lines ici aussi
+            view.scroll_offset += 1; // Droite = Bas
         }
     }
+
     // Nouvelle fonction pour trouver la vue active sans la modifier
     pub fn find_active_view(node: &SplitNode) -> Option<&View> {
         match node {
@@ -613,14 +699,14 @@ impl App {
                         rendered_lines.push((line.clone(), Color::Reset));
                     }
                 }
-
-                // 3. RENDU DES LIGNES (Avec coloration et recherche)
+                // 3. RENDU DES LIGNES (Vertical ou Horizontal)
                 let search_re = if !self.search_query.is_empty() {
                     Regex::new(&self.search_query).ok()
                 } else {
                     None
                 };
 
+                // --- MODE NORMAL (Horizontal) - Ton code actuel ---
                 let visible_lines = rendered_lines
                     .iter()
                     .skip(view.scroll_offset)
@@ -650,7 +736,6 @@ impl App {
                                 queue!(stdout, Print(&truncated[last_end..start]))?;
                             }
 
-                            // Surlignage de la recherche
                             queue!(
                                 stdout,
                                 SetForegroundColor(Color::Black),
@@ -659,7 +744,6 @@ impl App {
                                 ResetColor
                             )?;
 
-                            // Restauration de la couleur du diff
                             if *base_color != Color::Reset {
                                 queue!(stdout, SetForegroundColor(*base_color))?;
                             }
@@ -674,7 +758,6 @@ impl App {
                         queue!(stdout, Print(&truncated))?;
                     }
 
-                    // Sécurité
                     queue!(stdout, ResetColor)?;
                 }
             }
@@ -850,49 +933,6 @@ impl App {
             }
         }
     }
-    pub fn scroll_up(&mut self) {
-        if let Some(workspace) = self.workspaces.get_mut(self.active_workspace) {
-            if self.is_diff_mode {
-                // Mode Diff : On récupère les vues mutables et on fait défiler les deux premières
-                let mut views = Vec::new();
-                Self::collect_views_mut(&mut workspace.root, &mut views);
-
-                for view in views.into_iter().take(2) {
-                    view.scroll_offset = view.scroll_offset.saturating_sub(1);
-                }
-            } else if let Some(view) = Self::find_active_view_mut(&mut workspace.root) {
-                // Mode normal : On ne fait défiler que la vue active
-                view.scroll_offset = view.scroll_offset.saturating_sub(1);
-            }
-        }
-    }
-
-    pub fn scroll_down(&mut self) {
-        if let Some(workspace) = self.workspaces.get_mut(self.active_workspace) {
-            if self.is_diff_mode {
-                // Mode Diff : Défilement synchronisé des deux panneaux vers le bas
-                let mut views = Vec::new();
-                Self::collect_views_mut(&mut workspace.root, &mut views);
-
-                // Pour faire propre, on devrait idéalement vérifier la limite max de chaque buffer,
-                // mais pour commencer on peut forcer l'incrémentation des deux
-                for view in views.into_iter().take(2) {
-                    view.scroll_offset += 1;
-                }
-            } else if let Some(view) = Self::find_active_view_mut(&mut workspace.root) {
-                // Mode normal : Ta logique d'origine avec la vérification de la taille max
-                let max_lines = self
-                    .buffers
-                    .get(view.get_active_tab_hash().unwrap_or(&String::new()))
-                    .map(|b| b.lines.len())
-                    .unwrap_or(0);
-
-                if view.scroll_offset + 1 < max_lines {
-                    view.scroll_offset += 1;
-                }
-            }
-        }
-    }
 
     pub fn make(&mut self) -> &mut Self {
         for x in self.buffers.values() {
@@ -987,12 +1027,6 @@ impl App {
 
         enable_raw_mode().expect("Raw mode");
         execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide).ok();
-        // --- 1. PRISE DE CONTRÔLE DU TERMINAL ---
-        // On active le mode brut (les touches sont lues instantanément)
-        enable_raw_mode().expect("Échec de l'activation du mode brut");
-        // On passe sur l'écran alternatif et on cache le curseur
-        execute!(stdout, EnterAlternateScreen, crossterm::cursor::Hide)
-            .expect("Échec de la transition vers l'écran alternatif");
         let mut needs_redraw = true;
         // --- 2. BOUCLE PRINCIPALE ---
         loop {
@@ -1040,6 +1074,7 @@ impl App {
                 // Logique Mode Fenêtre (window_mode)
                 else if self.window_mode {
                     match e.code {
+                        KeyCode::Char('r') => self.toggle_layout(),
                         KeyCode::Char('v') => self.split_active_view(SplitDirection::Vertical),
                         KeyCode::Char('h') => self.split_active_view(SplitDirection::Horizontal),
                         KeyCode::Tab => self.cycle_focus(),
@@ -1051,12 +1086,25 @@ impl App {
                 // Logique standard
                 else {
                     match e.code {
+                        KeyCode::Char('r') if e.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(workspace) = self.workspaces.get_mut(self.active_workspace)
+                                && let Some(view) = Self::find_active_view_mut(&mut workspace.root)
+                            {
+                                view.is_rotated = !view.is_rotated;
+                            }
+                        }
                         KeyCode::Char('y') => {
                             self.copy_active_view_to_clipboard();
                         }
                         KeyCode::Char('/') => {
                             self.is_searching = true;
                             self.search_query.clear();
+                        }
+                        KeyCode::Left if e.modifiers.contains(KeyModifiers::SHIFT) => {
+                            self.scroll_left();
+                        }
+                        KeyCode::Right if e.modifiers.contains(KeyModifiers::SHIFT) => {
+                            self.scroll_right();
                         }
                         KeyCode::Char('d') => {
                             self.is_diff_mode = !self.is_diff_mode;
@@ -1096,6 +1144,7 @@ impl App {
                         {
                             self.window_mode = true
                         }
+
                         KeyCode::PageDown => self.next_workspace(),
                         KeyCode::PageUp => self.previous_workspace(),
                         KeyCode::Char('>') => self.adjust_active_ratio(0.05),
