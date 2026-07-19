@@ -13,11 +13,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "dwx",
-    version,
-    about = "Pager terminal minimaliste zéro bordure"
-)]
+#[command(name = "dwx", version, about = "Dalta Walk eXtended")]
 pub struct Cli {
     /// Le ou les fichiers à ouvrir dans les workspaces
     #[arg(required = false, num_args = 1..)]

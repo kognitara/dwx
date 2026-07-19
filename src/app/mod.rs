@@ -10,7 +10,7 @@ use crossterm::{
     terminal::{Clear, ClearType, EnterAlternateScreen, enable_raw_mode, size},
 };
 use regex::Regex;
-use std::io::{IsTerminal, Read, stdin};
+use std::io::{BufWriter, Cursor, IsTerminal, Read, stdin};
 use std::time::{Duration, SystemTime};
 use std::{
     collections::HashMap,
@@ -22,6 +22,9 @@ use std::{
     fs::remove_dir_all,
     io::{Write, stdout},
 };
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
 pub mod buffer;
 use similar::{ChangeTag, TextDiff};
 
@@ -91,8 +94,10 @@ impl Default for SplitNode {
         SplitNode::Leaf(View::default())
     }
 }
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct App {
+    pub ps: SyntaxSet,
+    pub ts: ThemeSet,
     /// Tes données pures (ce que tu as déjà)
     pub buffers: HashMap<String, Buffer>,
     is_searching: bool,
@@ -105,7 +110,32 @@ pub struct App {
     pub window_mode: bool,
     pub is_diff_mode: bool,
 }
+impl Default for App {
+    fn default() -> Self {
+        let mut ts = ThemeSet::load_defaults();
 
+        // On embarque le fichier de thème au moment de la compilation
+        let theme_data = include_str!("../../assets/Nord.tmTheme");
+
+        // On demande à syntect de lire ce thème
+        if let Ok(theme) = ThemeSet::load_from_reader(&mut Cursor::new(theme_data)) {
+            // On l'ajoute à la liste des thèmes disponibles sous le nom "vscode-dark-plus"
+            ts.themes.insert("nord".to_string(), theme);
+        }
+        Self {
+            ps: SyntaxSet::load_defaults_newlines(),
+            ts,
+            buffers: Default::default(),
+            is_searching: false,
+            search_query: Default::default(),
+            workspaces: Default::default(),
+            show_filenames: true,
+            active_workspace: 0,
+            window_mode: false,
+            is_diff_mode: false,
+        }
+    }
+}
 #[derive(Default, Clone, Debug)]
 pub struct Workspace {
     pub root: SplitNode,
@@ -490,9 +520,15 @@ impl App {
     }
     pub fn draw(&mut self) -> std::io::Result<()> {
         let (cols, rows) = size()?;
-        let mut stdout = stdout();
 
-        // Nettoyage de l'écran avant le rendu
+        // On récupère la sortie standard
+        let stdout_handle = stdout();
+
+        // NOUVEAU : On crée un buffer de 8 Mégaoctets !
+        // Rien ne partira vers l'écran avant que tu ne l'autorises.
+        let mut stdout = BufWriter::with_capacity(8 * 1024 * 1024, stdout_handle);
+
+        // Nettoyage de l'écran avant le rendu (gardé en mémoire, sans clignoter)
         queue!(stdout, Clear(ClearType::All))?;
 
         // Rendu de l'indicateur de workspace en haut à droite
@@ -592,7 +628,7 @@ impl App {
         &self,
         node: &SplitNode,
         area: Rect,
-        stdout: &mut std::io::Stdout,
+        stdout: &mut impl Write, // <--- Modification ici ! On remplace std::io::Stdout
     ) -> std::io::Result<()> {
         match node {
             SplitNode::Leaf(view) => {
@@ -705,34 +741,72 @@ impl App {
                 } else {
                     None
                 };
+                let fallback_hash = String::new();
+                let active_hash = view.get_active_tab_hash().unwrap_or(&fallback_hash);
+                let extension = if let Some(buffer) = self.buffers.get(active_hash) {
+                    // On extrait l'extension (ex: "rs", "toml", "md"), sinon on utilise "txt"
+                    buffer
+                        .original_path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .unwrap_or("txt")
+                } else {
+                    "txt"
+                };
+                let syntax = self
+                    .ps
+                    .find_syntax_by_extension(extension)
+                    .unwrap_or_else(|| self.ps.find_syntax_plain_text());
+                let mut h = HighlightLines::new(syntax, &self.ts.themes["nord"]);
 
+                // 2. PRÉCHAUFFAGE : On lit toutes les lignes cachées au-dessus de l'écran
+                if let Some(hash) = view.get_active_tab_hash()
+                    && let Some(buffer) = self.buffers.get(hash)
+                {
+                    for line in buffer.lines.iter().take(view.scroll_offset) {
+                        // On traite la ligne pour mettre à jour l'état de syntect, mais on ne l'affiche pas
+                        let _ = h.highlight_line(line, &self.ps);
+                    }
+                }
                 // --- MODE NORMAL (Horizontal) - Ton code actuel ---
                 let visible_lines = rendered_lines
                     .iter()
                     .skip(view.scroll_offset)
                     .take(content_height);
 
+                // On prépare la coloration en fonction du langage (ici forcé en Rust pour l'exemple)
+                // Dans l'idéal, tu pourrais extraire l'extension depuis buffer.original_name
+
                 for (i, (line, base_color)) in visible_lines.enumerate() {
                     queue!(
                         stdout,
                         crossterm::cursor::MoveTo(area.x, area.y + 1 + i as u16)
                     )?;
+
                     let truncated: String = line
                         .chars()
                         .skip(view.scroll_x)
                         .take(area.width as usize)
                         .collect();
-                    if *base_color != Color::Reset {
-                        queue!(stdout, SetForegroundColor(*base_color))?;
-                    }
 
-                    if let Some(re) = &search_re {
+                    // On vérifie si la ligne contient une occurrence de la recherche
+                    let is_search_match =
+                        search_re.as_ref().is_some_and(|re| re.is_match(&truncated));
+
+                    if is_search_match {
+                        // --- 1. SURLIGNAGE DE LA RECHERCHE ---
+                        let re = search_re.as_ref().unwrap();
                         let mut last_end = 0;
                         for mat in re.find_iter(&truncated) {
                             let start = mat.start();
                             let end = mat.end();
 
                             if start > last_end {
+                                if *base_color != Color::Reset {
+                                    queue!(stdout, SetForegroundColor(*base_color))?;
+                                } else {
+                                    queue!(stdout, ResetColor)?;
+                                }
                                 queue!(stdout, Print(&truncated[last_end..start]))?;
                             }
 
@@ -744,20 +818,55 @@ impl App {
                                 ResetColor
                             )?;
 
-                            if *base_color != Color::Reset {
-                                queue!(stdout, SetForegroundColor(*base_color))?;
-                            }
-
                             last_end = end;
                         }
-
                         if last_end < truncated.len() {
+                            if *base_color != Color::Reset {
+                                queue!(stdout, SetForegroundColor(*base_color))?;
+                            } else {
+                                queue!(stdout, ResetColor)?;
+                            }
                             queue!(stdout, Print(&truncated[last_end..]))?;
                         }
+                    } else if *base_color != Color::Reset {
+                        // --- 2. MODE DIFF (Rouge / Vert) ---
+                        queue!(stdout, SetForegroundColor(*base_color), Print(&truncated))?;
                     } else {
-                        queue!(stdout, Print(&truncated))?;
+                        // --- 3. COLORATION SYNTAXIQUE (Nord) ---
+                        let ranges: Vec<(syntect::highlighting::Style, &str)> =
+                            h.highlight_line(line, &self.ps).unwrap();
+
+                        let mut chars_skipped = 0;
+                        let mut chars_printed = 0;
+                        let max_width = area.width as usize;
+
+                        for (style, text) in ranges {
+                            if chars_printed >= max_width {
+                                break;
+                            }
+
+                            let mut display_text = String::new();
+                            for c in text.chars() {
+                                if chars_skipped < view.scroll_x {
+                                    chars_skipped += 1;
+                                } else if chars_printed < max_width {
+                                    display_text.push(c);
+                                    chars_printed += 1;
+                                }
+                            }
+
+                            if !display_text.is_empty() {
+                                let fg = Color::Rgb {
+                                    r: style.foreground.r,
+                                    g: style.foreground.g,
+                                    b: style.foreground.b,
+                                };
+                                queue!(stdout, SetForegroundColor(fg), Print(display_text))?;
+                            }
+                        }
                     }
 
+                    // On s'assure toujours de réinitialiser la couleur à la fin de la ligne
                     queue!(stdout, ResetColor)?;
                 }
             }
