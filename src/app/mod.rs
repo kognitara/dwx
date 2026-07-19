@@ -440,52 +440,46 @@ impl App {
                 let mut rendered_lines: Vec<(String, Color)> = Vec::new();
                 let mut is_diff_rendered = false;
 
-                if self.is_diff_mode {
-                    if let Some((b1, b2)) = self.get_diff_buffers() {
-                        let current_hash = view.get_active_tab_hash();
+                if self.is_diff_mode
+                    && let Some((b1, b2)) = self.get_diff_buffers()
+                {
+                    let current_hash = view.get_active_tab_hash();
 
-                        // On identifie les deux volets principaux
-                        let mut views = Vec::new();
-                        Self::collect_views(
-                            &self.workspaces[self.active_workspace].root,
-                            &mut views,
-                        );
+                    // On identifie les deux volets principaux
+                    let mut views = Vec::new();
+                    Self::collect_views(&self.workspaces[self.active_workspace].root, &mut views);
 
-                        let hash_left = views.get(0).and_then(|v| v.get_active_tab_hash());
-                        let hash_right = views.get(1).and_then(|v| v.get_active_tab_hash());
+                    let hash_left = views.first().and_then(|v| v.get_active_tab_hash());
+                    let hash_right = views.get(1).and_then(|v| v.get_active_tab_hash());
 
-                        let is_left = current_hash == hash_left;
-                        let is_right = current_hash == hash_right;
+                    let is_left = current_hash == hash_left;
+                    let is_right = current_hash == hash_right;
 
-                        // Si la vue courante fait partie du diff, on calcule et on aligne
-                        if is_left || is_right {
-                            is_diff_rendered = true;
-                            let t1 = b1.lines.join("\n");
-                            let t2 = b2.lines.join("\n");
-                            let diff = TextDiff::from_lines(&t1, &t2);
+                    // Si la vue courante fait partie du diff, on calcule et on aligne
+                    if is_left || is_right {
+                        is_diff_rendered = true;
+                        let t1 = b1.lines.join("\n");
+                        let t2 = b2.lines.join("\n");
+                        let diff = TextDiff::from_lines(&t1, &t2);
 
-                            for change in diff.iter_all_changes() {
-                                // On nettoie les retours à la ligne pour le rendu
-                                let val = change
-                                    .value()
-                                    .trim_end_matches(|c| c == '\n' || c == '\r')
-                                    .to_string();
+                        for change in diff.iter_all_changes() {
+                            // On nettoie les retours à la ligne pour le rendu
+                            let val = change.value().trim_end_matches(['\r', '\n']).to_string();
 
-                                match change.tag() {
-                                    ChangeTag::Equal => rendered_lines.push((val, Color::Reset)),
-                                    ChangeTag::Delete => {
-                                        if is_left {
-                                            rendered_lines.push((val, Color::Red));
-                                        } else {
-                                            rendered_lines.push(("".to_string(), Color::Reset)); // Ligne vide d'alignement
-                                        }
+                            match change.tag() {
+                                ChangeTag::Equal => rendered_lines.push((val, Color::Reset)),
+                                ChangeTag::Delete => {
+                                    if is_left {
+                                        rendered_lines.push((val, Color::Red));
+                                    } else {
+                                        rendered_lines.push(("".to_string(), Color::Reset)); // Ligne vide d'alignement
                                     }
-                                    ChangeTag::Insert => {
-                                        if is_left {
-                                            rendered_lines.push(("".to_string(), Color::Reset)); // Ligne vide d'alignement
-                                        } else {
-                                            rendered_lines.push((val, Color::Green));
-                                        }
+                                }
+                                ChangeTag::Insert => {
+                                    if is_left {
+                                        rendered_lines.push(("".to_string(), Color::Reset)); // Ligne vide d'alignement
+                                    } else {
+                                        rendered_lines.push((val, Color::Green));
                                     }
                                 }
                             }
@@ -494,14 +488,13 @@ impl App {
                 }
 
                 // Si le mode diff est désactivé ou qu'on n'a pas 2 volets valides, comportement normal
-                if !is_diff_rendered {
-                    if let Some(buffer) = self
+                if !is_diff_rendered
+                    && let Some(buffer) = self
                         .buffers
                         .get(view.get_active_tab_hash().unwrap_or(&"".to_string()))
-                    {
-                        for line in &buffer.lines {
-                            rendered_lines.push((line.clone(), Color::Reset));
-                        }
+                {
+                    for line in &buffer.lines {
+                        rendered_lines.push((line.clone(), Color::Reset));
                     }
                 }
 
@@ -881,19 +874,16 @@ impl App {
                 needs_redraw = false; // On baisse le drapeau une fois l'écran mis à jour
             }
             for (_, buffer) in self.buffers.iter_mut() {
-                if let Ok(metadata) = std::fs::metadata(&buffer.original_path) {
-                    if let Ok(modified) = metadata.modified() {
-                        if modified > buffer.last_modified {
-                            if let Ok(new_content) = std::fs::read_to_string(&buffer.original_path)
-                            {
-                                buffer.lines = new_content.lines().map(|s| s.to_string()).collect();
-                                buffer.last_modified = modified;
+                if let Ok(metadata) = std::fs::metadata(&buffer.original_path)
+                    && let Ok(modified) = metadata.modified()
+                    && modified > buffer.last_modified
+                    && let Ok(new_content) = std::fs::read_to_string(&buffer.original_path)
+                {
+                    buffer.lines = new_content.lines().map(|s| s.to_string()).collect();
+                    buffer.last_modified = modified;
 
-                                // NOUVEAU : Le fichier a été modifié, on demande un rafraîchissement
-                                needs_redraw = true;
-                            }
-                        }
-                    }
+                    // NOUVEAU : Le fichier a été modifié, on demande un rafraîchissement
+                    needs_redraw = true;
                 }
             }
 
