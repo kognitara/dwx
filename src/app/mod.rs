@@ -1,4 +1,5 @@
 use crate::{app::buffer::Buffer, crypto::hash};
+use arboard::Clipboard;
 use crossterm::event::poll;
 use crossterm::style::SetBackgroundColor;
 use crossterm::terminal::LeaveAlternateScreen;
@@ -154,6 +155,28 @@ impl View {
 }
 
 impl App {
+    pub fn copy_active_view_to_clipboard(&mut self) {
+        if let Some(workspace) = self.workspaces.get_mut(self.active_workspace)
+            && let Some(view) = Self::find_active_view_mut(&mut workspace.root)
+            && let Some(hash) = view.get_active_tab_hash()
+            && let Some(buffer) = self.buffers.get(hash)
+        {
+            // On rassemble toutes les lignes avec un retour à la ligne
+            let text_to_copy = buffer.lines.join("\n");
+
+            // ASTUCE : On utilise un thread_local pour s'assurer que la connexion
+            // Wayland n'est créée qu'une seule fois et survit à la fin de la fonction.
+            thread_local! {
+                static CLIPBOARD: std::cell::RefCell<Option<Clipboard>> = std::cell::RefCell::new(Clipboard::new().ok());
+            }
+
+            CLIPBOARD.with(|clipboard_cell| {
+                if let Some(clipboard) = clipboard_cell.borrow_mut().as_mut() {
+                    let _ = clipboard.set_text(text_to_copy);
+                }
+            });
+        }
+    }
     pub fn search_next(&mut self) {
         if self.search_query.is_empty() {
             return;
@@ -923,6 +946,9 @@ impl App {
                 // Logique standard
                 else {
                     match e.code {
+                        KeyCode::Char('y') => {
+                            self.copy_active_view_to_clipboard();
+                        }
                         KeyCode::Char('/') => {
                             self.is_searching = true;
                             self.search_query.clear();
