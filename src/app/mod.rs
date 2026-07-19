@@ -118,6 +118,7 @@ pub struct View {
     /// Pour le scrolling vertical (à quelle ligne on se trouve)
     pub scroll_offset: usize,
     pub is_active: bool,
+    pub scroll_x: usize,
 }
 impl Default for View {
     fn default() -> Self {
@@ -125,7 +126,8 @@ impl Default for View {
             tabs: Vec::new(),
             active_tab: 0,
             scroll_offset: 0,
-            is_active: true, // La première vue a toujours le focus par défaut
+            is_active: true,
+            scroll_x: 0, // La première vue a toujours le focus par défaut
         }
     }
 }
@@ -155,6 +157,21 @@ impl View {
 }
 
 impl App {
+    pub fn scroll_left(&mut self) {
+        if let Some(workspace) = self.workspaces.get_mut(self.active_workspace)
+            && let Some(view) = Self::find_active_view_mut(&mut workspace.root)
+        {
+            view.scroll_x = view.scroll_x.saturating_sub(1);
+        }
+    }
+
+    pub fn scroll_right(&mut self) {
+        if let Some(workspace) = self.workspaces.get_mut(self.active_workspace)
+            && let Some(view) = Self::find_active_view_mut(&mut workspace.root)
+        {
+            view.scroll_x += 1;
+        }
+    }
     // Nouvelle fonction pour trouver la vue active sans la modifier
     pub fn find_active_view(node: &SplitNode) -> Option<&View> {
         match node {
@@ -614,8 +631,11 @@ impl App {
                         stdout,
                         crossterm::cursor::MoveTo(area.x, area.y + 1 + i as u16)
                     )?;
-                    let truncated: String = line.chars().take(area.width as usize).collect();
-
+                    let truncated: String = line
+                        .chars()
+                        .skip(view.scroll_x)
+                        .take(area.width as usize)
+                        .collect();
                     if *base_color != Color::Reset {
                         queue!(stdout, SetForegroundColor(*base_color))?;
                     }
@@ -809,6 +829,15 @@ impl App {
                 last_modified,
             },
         );
+        if !self.workspaces.is_empty()
+            && let Some(workspace) = self.workspaces.get_mut(self.active_workspace)
+            && let Some(view) = Self::find_active_view_mut(&mut workspace.root)
+            && !view.tabs.contains(&h)
+        {
+            view.tabs.push(h.clone());
+            // On donne automatiquement le focus au nouvel onglet
+            view.active_tab = view.tabs.len() - 1;
+        }
         self
     }
 
@@ -1056,6 +1085,8 @@ impl App {
                                 }
                             }
                         }
+                        KeyCode::Char('h') => self.scroll_left(),
+                        KeyCode::Char('l') => self.scroll_right(),
                         KeyCode::Char('w')
                             if event
                                 .as_key_event()
