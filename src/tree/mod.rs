@@ -6,8 +6,8 @@ use crossterm::{
 };
 use is_executable::IsExecutable;
 use std::env;
-use std::fs::{self, Permissions};
-use std::fs::{File, Metadata};
+use std::fs::{self};
+use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::stdout;
@@ -30,7 +30,6 @@ pub struct MillerState {
     // Les 3 colonnes d'affichage
     pub parent_entries: Vec<FileItem>, // Colonne de gauche (Contexte)
     pub current_entries: Vec<FileItem>, // Colonne centrale (Focus)
-    pub preview_entries: Vec<FileItem>, // Colonne de droite (Aperçu d'un sous-dossier)
     pub preview: Preview,
     pub selected_index: usize,
 }
@@ -41,7 +40,6 @@ impl MillerState {
             current_dir: start_dir,
             parent_entries: Vec::new(),
             current_entries: Vec::new(),
-            preview_entries: Vec::new(),
             selected_index: 0,
             preview: Preview::Empty,
         };
@@ -275,7 +273,6 @@ pub struct FileItem {
     pub is_file: bool,
     pub is_executable: bool,
     pub is_symlink: bool,
-    pub meta: Metadata,
 }
 
 impl FileItem {
@@ -290,7 +287,6 @@ impl FileItem {
         let is_file = path.is_file();
         let is_executable = path.is_executable();
         let is_symlink = path.is_symlink();
-        let meta = path.as_path().metadata().expect("failed to get metadata");
         Self {
             path,
             name,
@@ -298,7 +294,6 @@ impl FileItem {
             is_executable,
             is_file,
             is_symlink,
-            meta,
         }
     }
 }
