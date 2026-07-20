@@ -10,9 +10,14 @@ mod ux;
 mod views;
 mod workspaces;
 
-use crate::app::App;
+use crate::{app::App, tree::MillerState};
 use clap::Parser;
-use std::path::PathBuf;
+use crossterm::{
+    cursor::{Hide, Show},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use std::{env::current_dir, io::stdout, path::PathBuf, process::ExitCode};
 
 #[derive(Parser, Debug)]
 #[command(name = "dwx", version, about = "Data Walk eXtended")]
@@ -22,28 +27,35 @@ pub struct Cli {
     pub files: Vec<PathBuf>,
 }
 
-fn main() {
+fn main() -> ExitCode {
     // 1. On parse les arguments
     let cli = Cli::parse();
 
+    if cli.files.is_empty() {
+        execute!(stdout(), EnterAlternateScreen, Hide).expect("faiedl to enteralternate screen");
+        // On désactive l'écho des touches et on lit le clavier en temps réel (Raw Mode)
+        enable_raw_mode().expect("failed to enabled raw mode");
+        let state = MillerState::new(current_dir().expect("faield to get current dir"));
+        let app_result = MillerState::run(state);
+        disable_raw_mode().expect("failed to disabled raw mode");
+        execute!(stdout(), Show, LeaveAlternateScreen).expect("failed to exit alternate screen");
+        if let Err(err) = app_result {
+            eprintln!("Erreur critique dans dwx : {}", err);
+            return ExitCode::FAILURE;
+        } else {
+            return ExitCode::SUCCESS;
+        }
+    }
     let mut app = App::default();
     app.add_workspaces();
 
     // 2. On traite le pipe S'IL Y EN A UN
     app.add_stdin();
-
-    // 3. On traite les fichiers ou dossiers fournis en arguments
     for path in &cli.files {
         if path.is_file() {
             app.add_file(path);
-        } else if path.is_dir() {
-            // Activation du mode arbre si un dossier est détecté !
-            app.is_tree_mode = true;
-            app.tree_state.load_directory(path, 0);
         }
     }
-
-    // 4. On charge les onglets
     let hashes: Vec<String> = app.buffers.keys().cloned().collect();
     if let Some(workspace) = app.workspaces.get_mut(0)
         && let Some(view) = App::find_active_view_mut(&mut workspace.root)
@@ -54,6 +66,5 @@ fn main() {
             }
         }
     }
-    // 5. Go ! On lance la boucle d'événements qui appellera make() en continu
-    app.run();
+    app.run()
 }

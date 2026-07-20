@@ -1,6 +1,6 @@
 use crate::{app::buffer::Buffer, crypto::hash};
 use arboard::Clipboard;
-use crossterm::event::{Event, poll};
+use crossterm::event::poll;
 use crossterm::style::SetBackgroundColor;
 use crossterm::terminal::LeaveAlternateScreen;
 use crossterm::{
@@ -26,8 +26,6 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 pub mod buffer;
-use crate::tree::TreeState;
-use crossterm::cursor::MoveTo;
 use similar::{ChangeTag, TextDiff};
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Rect {
@@ -99,8 +97,6 @@ impl Default for SplitNode {
 pub struct App {
     pub ps: SyntaxSet,
     pub ts: ThemeSet,
-    pub tree_state: TreeState,
-    pub is_tree_mode: bool,
     /// Tes données pures (ce que tu as déjà)
     pub buffers: HashMap<String, Buffer>,
     is_searching: bool,
@@ -138,8 +134,6 @@ impl Default for App {
             window_mode: false,
             is_diff_mode: false,
             show_help: false,
-            tree_state: TreeState::default(),
-            is_tree_mode: false,
         }
     }
 }
@@ -1113,160 +1107,11 @@ impl App {
         }
     }
     pub fn make(&mut self) -> &mut Self {
-        if self.is_tree_mode {
-            let mut stdout = stdout();
-
-            // 1. Récupération des dimensions réelles du terminal
-            let (cols, rows) = size().unwrap_or((80, 24));
-            let terminal_height = rows as usize;
-            let tree_width = (cols / 3) as usize; // L'arbre prend un tiers de l'écran à gauche
-
-            // On nettoie l'écran entier dans le buffer (sans l'afficher de suite)
-            queue!(stdout, Clear(ClearType::All)).unwrap();
-
-            // 2. Préparation des éléments visibles de la colonne de gauche (L'arbre)
-            let visible_items: Vec<_> = self
-                .tree_state
-                .items
-                .iter()
-                .filter(|i| i.is_visible)
-                .collect();
-
-            // Application du scroll_offset pour ne dessiner que ce qui rentre dans l'écran
-            let display_items = visible_items
-                .iter()
-                .skip(self.tree_state.scroll_offset)
-                .take(terminal_height);
-
-            // 3. Dessin de l'arbre
-            for (i, item) in display_items.enumerate() {
-                // L'index réel dans la liste visible (pour la surbrillance)
-                let actual_index = i + self.tree_state.scroll_offset;
-                let is_selected = actual_index == self.tree_state.selected_index;
-
-                // Positionnement du curseur au début de la ligne 'i'
-                queue!(stdout, MoveTo(0, i as u16)).unwrap();
-
-                if is_selected {
-                    // Surbrillance pour la ligne sous le curseur (ex: fond gris foncé)
-                    queue!(stdout, SetBackgroundColor(Color::DarkGrey)).unwrap();
-                }
-
-                // Formatage : Indentation dynamique, Icône basique et Nom
-                let indent = "  ".repeat(item.depth);
-                let icon = if item.is_dir { "" } else { "" }; // Géré par tes Devicons plus tard
-                let date_str = crate::tree::format_time_ago(item.modified);
-
-                // Construction de la ligne complète
-                let mut line = format!("{}{} {} ({})", indent, icon, item.name, date_str);
-
-                // On s'assure de ne pas dépasser la largeur de la colonne (tree_width)
-                if line.chars().count() > tree_width {
-                    line = line.chars().take(tree_width - 1).collect::<String>();
-                    line.push('…');
-                } else {
-                    // On comble avec des espaces pour que le fond gris de sélection aille jusqu'au bout
-                    line.push_str(&" ".repeat(tree_width - line.chars().count()));
-                }
-
-                // On écrit la ligne et on reset les couleurs immédiatement
-                queue!(stdout, Print(line), ResetColor).unwrap();
-            }
-
-            // 4. Dessin de la ligne de séparation (Optionnel mais indispensable pour la lisibilité)
-            for i in 0..terminal_height {
-                queue!(
-                    stdout,
-                    MoveTo(tree_width as u16, i as u16),
-                    SetForegroundColor(Color::DarkGrey),
-                    Print("│"),
-                    ResetColor
-                )
-                .unwrap();
-            }
-            // 5. Dessin de la colonne de droite (La Preview)
-            let preview_lines = self.tree_state.render_preview(terminal_height);
-
-            let preview_start_x = tree_width + 2;
-            let max_preview_width = cols as usize - preview_start_x;
-
-            // On choisit un thème sombre natif à syntect (tu pourras en tester d'autres)
-            let theme = &self.ts.themes["nord"];
-
-            // On cherche le bon langage en fonction de l'extension du fichier sélectionné
-            let syntax = if let Some(item) = self.tree_state.get_selected_item() {
-                let extension = item.path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                self.ps
-                    .find_syntax_by_extension(extension)
-                    .unwrap_or_else(|| self.ps.find_syntax_plain_text())
-            } else {
-                self.ps.find_syntax_plain_text()
-            };
-
-            // On crée l'outil qui va lire le code ligne par ligne
-            let mut highlighter = HighlightLines::new(syntax, theme);
-            // ------------------------------------------------------
-
-            for (i, line) in preview_lines.iter().enumerate() {
-                queue!(stdout, MoveTo(preview_start_x as u16, i as u16)).unwrap();
-
-                let display_line = if line.chars().count() > max_preview_width {
-                    line.chars().take(max_preview_width).collect::<String>()
-                } else {
-                    line.clone()
-                };
-
-                // SYNTECT : Découpage de la ligne en "morceaux" avec leurs couleurs
-                let ranges: Vec<(syntect::highlighting::Style, &str)> = highlighter
-                    .highlight_line(&display_line, &self.ps)
-                    .unwrap_or_default();
-
-                // On affiche chaque morceau avec la couleur exacte calculée par syntect
-                for (style, text) in ranges {
-                    // Conversion de la couleur syntect (RGB) vers crossterm
-                    let fg_color = Color::Rgb {
-                        r: style.foreground.r,
-                        g: style.foreground.g,
-                        b: style.foreground.b,
-                    };
-
-                    queue!(stdout, SetForegroundColor(fg_color), Print(text)).unwrap();
-                }
-
-                // Très important : On reset la couleur à la fin de chaque ligne
-                // pour ne pas baver sur le reste de l'interface !
-                queue!(stdout, ResetColor).unwrap();
-            }
-            // 5. Dessin de la colonne de droite (La Preview)
-            let preview_lines = self.tree_state.render_preview(terminal_height);
-
-            // Marge de 2 caractères pour ne pas coller au séparateur
-            let preview_start_x = tree_width + 2;
-            let max_preview_width = cols as usize - preview_start_x;
-
-            for (i, line) in preview_lines.iter().enumerate() {
-                queue!(stdout, MoveTo(preview_start_x as u16, i as u16)).unwrap();
-
-                // Troncature pour empêcher les longues lignes de code de revenir à la ligne
-                // et de détruire la structure de ton arbre visuel
-                let display_line = if line.chars().count() > max_preview_width {
-                    line.chars().take(max_preview_width).collect::<String>()
-                } else {
-                    line.clone()
-                };
-
-                queue!(stdout, Print(display_line)).unwrap();
-            }
-
-            // 6. On balance tout sur le terminal en une seule passe !
-            stdout.flush().unwrap();
-        } else {
-            // Mode Classique
-            for x in self.buffers.values() {
-                let mut f = File::create(&x.temp_path).expect("failed to create file");
-                f.write_all(x.lines.join("\n").as_bytes()).expect("msg");
-                f.sync_all().expect("failed to gen");
-            }
+        // Mode Classique
+        for x in self.buffers.values() {
+            let mut f = File::create(&x.temp_path).expect("failed to create file");
+            f.write_all(x.lines.join("\n").as_bytes()).expect("msg");
+            f.sync_all().expect("failed to gen");
         }
 
         self
@@ -1360,39 +1205,6 @@ impl App {
             // 1. On dessine l'interface appropriée (ça appelle la fonction make() qu'on a écrite)
             self.make();
 
-            // 2. On attend que l'utilisateur tape sur le clavier
-            if let Event::Key(key) = event::read().expect("Erreur de lecture du clavier") {
-                // 3. L'AIGUILLEUR : Est-ce qu'on est dans l'arbre ou dans le code ?
-                if self.is_tree_mode {
-                    // --- COMMANDES DU MODE ARBRE ---
-                    match key.code {
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            self.tree_state.move_down();
-                        }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            self.tree_state.move_up();
-                        }
-                        KeyCode::Enter | KeyCode::Char('l') => {
-                            // C'est ici que tu ouvres le fichier !
-                            if let Some(item) = self.tree_state.get_selected_item().cloned()
-                                && !item.is_dir
-                            {
-                                // On charge le fichier dans ton workspace
-                                self.add_file(&item.path);
-                                // ET ON QUITTE LE MODE ARBRE !
-                                self.is_tree_mode = false;
-                            }
-                        }
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            // Quitter dwx
-                            break;
-                        }
-                        // Tu pourras ajouter ici la recherche avec '/' plus tard
-                        _ => {}
-                    }
-                }
-            }
-            // A. Rendu de l'interface
             if needs_redraw {
                 self.draw().expect("Erreur de rendu");
                 needs_redraw = false; // On baisse le drapeau une fois l'écran mis à jour

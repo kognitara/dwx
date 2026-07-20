@@ -1,153 +1,288 @@
-use ignore::WalkBuilder;
+use crate::ui::draw;
+use crossterm::event::{Event, KeyCode, KeyEventKind, read};
+use crossterm::{
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use std::env;
+use std::fs;
 use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader;
+use std::io::stdout;
+use std::path::Path;
 use std::path::PathBuf;
-use std::time::SystemTime;
-#[derive(Debug, Clone)]
-pub struct TreeItem {
-    pub path: PathBuf,
-    pub name: String,
-    pub is_dir: bool,
-    pub depth: usize,
-    pub is_expanded: bool, // Permet de savoir si on a appuyé sur 'l' dessus[cite: 1]
-    pub is_visible: bool,  // Géré par le filtre de recherche dynamique[cite: 1]
-    pub modified: SystemTime,
+use std::process::Command;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
+use syntect::util::as_24_bit_terminal_escaped;
+
+pub enum Preview {
+    Dir(Vec<FileItem>),
+    File(Vec<String>), // Lignes de texte pré-formatées avec les couleurs ANSI
+    Empty,
+}
+pub struct MillerState {
+    pub current_dir: PathBuf,
+
+    // Les 3 colonnes d'affichage
+    pub parent_entries: Vec<FileItem>, // Colonne de gauche (Contexte)
+    pub current_entries: Vec<FileItem>, // Colonne centrale (Focus)
+    pub preview_entries: Vec<FileItem>, // Colonne de droite (Aperçu d'un sous-dossier)
+    pub preview: Preview,
+    pub selected_index: usize,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct TreeState {
-    pub items: Vec<TreeItem>,
-    pub selected_index: usize, // Là où se trouve le curseur (j/k)[cite: 1]
-    pub scroll_offset: usize,  // Pour le défilement de l'arbre[cite: 1]
-}
-impl TreeState {
-    // Récupère l'élément actuellement sous le curseur
-    pub fn get_selected_item(&self) -> Option<&TreeItem> {
-        // On filtre pour ne compter que les éléments visibles !
-        self.items
-            .iter()
-            .filter(|i| i.is_visible)
-            .nth(self.selected_index)
+impl MillerState {
+    pub fn new(start_dir: PathBuf) -> Self {
+        let mut state = Self {
+            current_dir: start_dir,
+            parent_entries: Vec::new(),
+            current_entries: Vec::new(),
+            preview_entries: Vec::new(),
+            selected_index: 0,
+            preview: Preview::Empty,
+        };
+
+        state.refresh(); // On charge les données initiales
+        state
     }
-}
-pub fn format_time_ago(modified: SystemTime) -> String {
-    let duration = SystemTime::now()
-        .duration_since(modified)
-        .unwrap_or_default();
-    let secs = duration.as_secs();
+    /// Lit un fichier et retourne ses lignes avec la coloration syntaxique ANSI
+    fn read_and_highlight(path: &Path) -> Vec<String> {
+        // Initialisation de syntect (ces objets pourraient être mis en cache dans MillerState pour encore plus de perfs)
+        let ps = SyntaxSet::load_defaults_newlines();
+        let ts = ThemeSet::load_defaults();
 
-    match secs {
-        0..=59 => "now".to_string(),
-        60..=3599 => format!("{} min", secs / 60),
-        3600..=86399 => format!("{} h", secs / 3600),
-        86400..=604799 => format!("{} d", secs / 86400),
-        _ => format!("{} sem", secs / 604800),
+        // Choix d'un thème adapté pour un fond sombre
+        let theme = &ts.themes["base16-ocean.dark"];
+
+        // 1. Détection du langage d'après l'extension du fichier
+        let syntax = ps
+            .find_syntax_for_file(path)
+            .unwrap_or(None)
+            .unwrap_or_else(|| ps.find_syntax_plain_text());
+
+        let mut h = HighlightLines::new(syntax, theme);
+        let mut highlighted_lines = Vec::new();
+
+        // 2. Lecture sécurisée (On limite l'aperçu pour éviter de freeze sur un log de 2Go)
+        if let Ok(file) = File::open(path) {
+            let reader = BufReader::new(file);
+            for line in reader.lines().map_while(Result::ok).take(100) {
+                // On rajoute un saut de ligne car syntect en a besoin pour son parsing
+                let line_with_nl = format!("{}\n", line);
+
+                // 3. Application des couleurs
+                if let Ok(ranges) = h.highlight_line(&line_with_nl, &ps) {
+                    // Conversion des structs de couleur en chaîne de caractères avec codes ANSI
+                    let escaped = as_24_bit_terminal_escaped(&ranges[..], true);
+                    // On enlève le retour à la ligne pour le rendu crossterm
+                    highlighted_lines.push(escaped.trim_end().to_string());
+                }
+            }
+        } else {
+            highlighted_lines.push("Impossible de lire le fichier...".to_string());
+        }
+
+        // Toujours forcer la réinitialisation des couleurs à la fin
+        highlighted_lines.push("\x1b[0m".to_string());
+        highlighted_lines
     }
-}
-
-impl TreeState {
-    pub fn move_down(&mut self) {
-        let visible_count = self.items.iter().filter(|i| i.is_visible).count();
-        if visible_count > 0 && self.selected_index < visible_count - 1 {
-            self.selected_index += 1;
+    /// Fonction utilitaire pour lire un dossier et retourner un vecteur trié
+    fn read_dir_entries(dir: &Path) -> Vec<FileItem> {
+        let mut entries = Vec::new();
+        if let Ok(read_dir) = fs::read_dir(dir) {
+            for entry in read_dir.flatten() {
+                entries.push(FileItem::from_path(entry.path()));
+            }
+        }
+        // Optionnel : Trier pour avoir les dossiers en premier, puis par ordre alphabétique
+        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        });
+        entries
+    }
+    pub fn enter_dir(&mut self) {
+        // Clippy est content : on fait tout sur une seule ligne
+        if let Some(selected) = self.current_entries.get(self.selected_index)
+            && selected.is_dir
+        {
+            self.current_dir = selected.path.clone();
+            self.selected_index = 0;
+            self.refresh();
         }
     }
 
+    // On passe ton state initialisé à cette fonction
+    pub fn run(mut state: MillerState) -> std::io::Result<()> {
+        // On dessine l'état initial une première fois avant de bloquer sur read()
+        draw(&state)?;
+
+        loop {
+            // L'application attend ici jusqu'à ce qu'une touche soit pressée
+            if let Event::Key(key) = read()? {
+                // Sécurité : on ignore les événements de relâchement de touche
+                // pour éviter que l'action ne s'exécute deux fois sur certains systèmes
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                match key.code {
+                    // --- QUITTER ---
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+
+                    // --- NAVIGATION VERTICALE (Haut/Bas) ---
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        state.move_down();
+                        draw(&state)?; // On redessine après chaque changement
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        state.move_up();
+                        draw(&state)?;
+                    }
+
+                    // --- GLISSEMENT DROITE (Entrer / Espace) ---
+                    KeyCode::Char('l') | KeyCode::Right | KeyCode::Char(' ') => {
+                        state.enter_dir();
+                        draw(&state)?;
+                    }
+
+                    // --- GLISSEMENT GAUCHE (Retour) ---
+                    KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+                        state.go_parent();
+                        draw(&state)?;
+                    }
+
+                    // --- HANDOFF (Ouvrir l'éditeur) ---
+                    KeyCode::Char('o') | KeyCode::Enter => {
+                        if let Some(selected) = state.current_entries.get(state.selected_index) {
+                            // 1. Préparation de l'éditeur (hx par défaut)
+                            let editor = env::var("EDITOR").unwrap_or_else(|_| "hx".to_string());
+
+                            // 2. On rend le terminal à l'OS (Crucial !)
+                            disable_raw_mode()?;
+                            execute!(stdout(), LeaveAlternateScreen)?;
+
+                            // 3. On lance l'éditeur et on bloque dwx en attendant qu'il se ferme
+                            let _ = Command::new(&editor).arg(&selected.path).status()?;
+
+                            // 4. L'éditeur est fermé, on reprend le contrôle du terminal
+                            execute!(stdout(), EnterAlternateScreen)?;
+                            enable_raw_mode()?;
+
+                            // 5. On rafraîchit l'état au cas où tu aurais créé/supprimé/renommé
+                            // des choses depuis ton éditeur, et on redessine l'interface
+                            state.refresh();
+                            draw(&state)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(())
+    }
+    /// Glissement vers la gauche (Revenir au parent)
+    pub fn go_parent(&mut self) {
+        if let Some(parent) = self.current_dir.parent() {
+            // Petite astuce d'UX : on mémorise le nom du dossier d'où on vient
+            // pour repositionner le curseur dessus une fois dans le parent
+            let previous_dir_name = self
+                .current_dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            self.current_dir = parent.to_path_buf();
+            self.refresh(); // Un premier rafraîchissement pour charger la nouvelle liste
+
+            // On cherche où se trouve notre ancien dossier pour y placer le curseur
+            if let Some(pos) = self
+                .current_entries
+                .iter()
+                .position(|e| e.name == previous_dir_name)
+            {
+                self.selected_index = pos;
+            } else {
+                self.selected_index = 0;
+            }
+
+            self.refresh(); // Un second rafraîchissement pour mettre à jour la colonne d'aperçu
+        }
+    }
+    /// Met à jour les 3 colonnes en fonction du `current_dir` et du `selected_index`
+    pub fn refresh(&mut self) {
+        // 1. Colonne centrale : On lit le dossier actuel
+        self.current_entries = Self::read_dir_entries(&self.current_dir);
+
+        // On sécurise l'index au cas où le dossier contient moins de fichiers qu'avant
+        if self.current_entries.is_empty() {
+            self.selected_index = 0;
+        } else if self.selected_index >= self.current_entries.len() {
+            self.selected_index = self.current_entries.len() - 1;
+        }
+
+        // 2. Colonne de gauche : On lit le parent (s'il existe)
+        if let Some(parent) = self.current_dir.parent() {
+            self.parent_entries = Self::read_dir_entries(parent);
+        } else {
+            self.parent_entries.clear(); // On est à la racine du système
+        }
+        // 3. Colonne de droite : C'est ici qu'on utilise le nouvel enum et la fonction !
+        self.preview = Preview::Empty;
+
+        if let Some(selected) = self.current_entries.get(self.selected_index) {
+            if selected.is_dir {
+                self.preview = Preview::Dir(Self::read_dir_entries(&selected.path));
+            } else {
+                // Fini le code mort ! On appelle enfin la coloration syntaxique
+                self.preview = Preview::File(Self::read_and_highlight(&selected.path));
+            }
+        }
+    }
+
+    // Déplacement vers le bas (j)
+    pub fn move_down(&mut self) {
+        if !self.current_entries.is_empty() && self.selected_index < self.current_entries.len() - 1
+        {
+            self.selected_index += 1;
+            // On rafraîchit seulement si la nouvelle sélection est un dossier
+            // pour mettre à jour la colonne de droite
+            self.refresh();
+        }
+    }
+
+    // Déplacement vers le haut (k)
     pub fn move_up(&mut self) {
         if self.selected_index > 0 {
             self.selected_index -= 1;
+            self.refresh();
         }
     }
-    // Fonction appelée à chaque fois que tu tapes ou effaces une lettre dans la recherche
-    pub fn apply_filter(&mut self, query: &str) {
-        let query_lower = query.to_lowercase();
+}
 
-        for item in &mut self.items {
-            if query.is_empty() {
-                item.is_visible = true; // On affiche tout si le filtre est vide
-            } else {
-                // Règle de visibilité : le nom contient la recherche, OU c'est le dossier parent actuel
-                item.is_visible = item.name.to_lowercase().contains(&query_lower);
-            }
-        }
+#[derive(Clone, Debug)]
+pub struct FileItem {
+    pub path: PathBuf,
+    pub name: String,
+    pub is_dir: bool,
+}
 
-        // Attention : si on réduit la liste, le curseur (selected_index) pourrait
-        // se retrouver hors limites. On le remet à 0 par sécurité.
-        self.selected_index = 0;
-        self.scroll_offset = 0;
-    }
+impl FileItem {
+    // Un petit constructeur pratique
+    pub fn from_path(path: PathBuf) -> Self {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let is_dir = path.is_dir();
 
-    pub fn render_preview(&self, height: usize) -> Vec<String> {
-        let mut lines = Vec::new();
-
-        // On utilise simplement self.get_selected_item()
-        if let Some(item) = self.get_selected_item() {
-            if !item.is_dir
-                && let Ok(file) = File::open(&item.path)
-            {
-                let reader = BufReader::new(file);
-                for line in reader.lines().take(height).flatten() {
-                    lines.push(line);
-                }
-            } else {
-                lines.push("C'est un dossier. Appuyez sur 'l' pour l'ouvrir.".to_string());
-            }
-        }
-        // Ensuite, tu passes `lines` à ton module `syntect` existant pour la coloration
-        lines
-    }
-    pub fn load_directory(&mut self, dir_path: &PathBuf, depth: usize) {
-        // Initialisation de WalkBuilder sur le répertoire cible
-        let mut builder = WalkBuilder::new(dir_path);
-
-        // La magie pour ton VCS : prise en charge native de ton ignore custom !
-        builder.add_custom_ignore_filename(".awqignore");
-
-        // On limite la profondeur à 1 pour ne charger que le niveau actuel
-        // (l'expansion des sous-dossiers se fera au clic/bouton 'l')
-        builder.max_depth(Some(1));
-
-        // On garde par défaut les fichiers cachés (comme .awq) s'ils ne sont pas explicitement ignorés
-        builder.hidden(false);
-
-        let mut new_items = Vec::new();
-
-        // WalkBuilder gère le multi-threading en interne si besoin, mais .build() est un itérateur simple
-        for result in builder.build().flatten() {
-            let path = result.path();
-
-            // On évite d'ajouter le dossier racine lui-même dans l'arbre
-            if path == dir_path {
-                continue;
-            }
-
-            if let Ok(metadata) = path.metadata() {
-                let is_dir = metadata.is_dir();
-                let name = path.file_name().expect("msg").to_string_lossy().to_string();
-
-                // Fini les checks manuels `.git` ou `target`, `WalkBuilder` l'a déjà filtré !
-
-                new_items.push(TreeItem {
-                    path: path.to_path_buf(),
-                    name,
-                    is_dir,
-                    depth,
-                    is_expanded: false,
-                    is_visible: true,
-                    modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                });
-            }
-        }
-
-        // Un petit tri alphabétique en mettant les dossiers en premier, c'est toujours plus propre[cite: 1]
-        new_items.sort_by(|a, b| {
-            b.is_dir
-                .cmp(&a.is_dir)
-                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-
-        // On insère `new_items` dans l'état `TreeState` global
-        self.items.extend(new_items);
+        Self { path, name, is_dir }
     }
 }
