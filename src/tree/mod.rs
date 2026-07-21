@@ -4,12 +4,16 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use ignore::WalkBuilder;
 use is_executable::IsExecutable;
+use std::collections::HashMap;
 use std::fs::File;
 use std::fs::{self};
 use std::io::BufReader;
 use std::io::{BufRead, stdout};
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -23,6 +27,11 @@ use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use syntect::util::as_24_bit_terminal_escaped;
 
+// La "photo" de l'état d'un dossier
+pub struct DirState {
+    pub selected_index: usize,
+    pub scroll_offset: usize,
+}
 pub enum AppMode {
     Normal,
     Omnibar {
@@ -41,13 +50,23 @@ pub struct MillerState {
     pub current_dir: PathBuf,
     pub filtered_indices: Vec<usize>, // Le calque : juste une liste de chiffres (les index)
     pub mode: AppMode,
-    // Les 3 colonnes d'affichage
     pub parent_entries: Vec<FileItem>, // Colonne de gauche (Contexte)
     pub current_entries: Vec<FileItem>, // Colonne centrale (Focus)
+    // Le registre de navigation
+    pub history: HashMap<PathBuf, DirState>,
     pub preview: Preview,
     pub selected_index: usize,
     pub scroll_offset: usize,
     pub pending_g: bool,
+    pub pending_create: bool,
+    pub pending_create_dir: bool,
+    pub pending_create_symlink: bool,
+    pub pending_create_file: bool,
+    pub pending_create_connection: bool,
+    pub pending_create_hard_link: bool,
+    pub pending_create_archive: bool,
+    pub pending_create_branch: bool,
+    pub pending_create_new_project: bool,
 }
 
 impl MillerState {
@@ -62,6 +81,16 @@ impl MillerState {
             mode: AppMode::Normal,
             scroll_offset: 0,
             pending_g: false,
+            pending_create: false,
+            pending_create_dir: false,
+            pending_create_file: false,
+            pending_create_symlink: false,
+            pending_create_connection: false,
+            pending_create_archive: false,
+            pending_create_hard_link: false,
+            pending_create_branch: false,
+            pending_create_new_project: false,
+            history: HashMap::new(),
         };
         state.refresh(); // On charge les données initiales
         state
@@ -251,9 +280,25 @@ impl MillerState {
     pub fn enter_dir(&mut self) {
         if let Some(&actual_index) = self.filtered_indices.get(self.selected_index)
             && let Some(selected) = self.current_entries.get(actual_index)
+            && selected.path.is_dir()
         {
+            self.history.insert(
+                self.current_dir.clone(),
+                DirState {
+                    selected_index: self.selected_index,
+                    scroll_offset: self.scroll_offset,
+                },
+            );
             self.current_dir = selected.path.clone();
             self.selected_index = 0;
+            if let Some(saved_state) = self.history.get(&self.current_dir) {
+                self.selected_index = saved_state.selected_index;
+                self.scroll_offset = saved_state.scroll_offset;
+            } else {
+                // C'est la première fois qu'on y entre, on remet les compteurs à zéro
+                self.selected_index = 0;
+                self.scroll_offset = 0;
+            }
             self.refresh();
         }
     }
@@ -286,49 +331,192 @@ impl MillerState {
             }
 
             // --- 2. ÉCOUTE DU CLAVIER (Non-bloquant, 16ms = ~60 FPS) ---
-            if poll(Duration::from_millis(16))? {
-                if let Event::Key(key) = read()? {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
+            if poll(Duration::from_millis(16))?
+                && let Event::Key(key) = read()?
+                && key.kind == KeyEventKind::Press
+            {
+                if state.pending_g {
+                    state.pending_g = false; // On désarme le piège immédiatement
 
-                    if state.pending_g {
-                        state.pending_g = false; // On désarme le piège immédiatement
+                    let target_dir = match key.code {
+                        KeyCode::Char('h') => dirs::home_dir(),
+                        KeyCode::Char('D') => dirs::download_dir(),
+                        KeyCode::Char('d') => dirs::document_dir(),
+                        KeyCode::Char('a') => dirs::audio_dir(),
+                        KeyCode::Char('b') => dirs::executable_dir(),
+                        KeyCode::Char('c') => dirs::config_dir(),
+                        KeyCode::Char('p') => dirs::picture_dir(),
+                        KeyCode::Char('v') => dirs::video_dir(),
+                        KeyCode::Char('f') => dirs::font_dir(),
+                        KeyCode::Char('t') => dirs::template_dir(),
+                        KeyCode::Char('r') => Some(std::path::PathBuf::from("/")),
+                        _ => None, // Si on tape une autre touche, on annule l'action
+                    };
 
-                        let target_dir = match key.code {
-                            KeyCode::Char('h') => dirs::home_dir(),
-                            KeyCode::Char('D') => dirs::download_dir(),
-                            KeyCode::Char('d') => dirs::document_dir(),
-                            KeyCode::Char('a') => dirs::audio_dir(),
-                            KeyCode::Char('b') => dirs::executable_dir(),
-                            KeyCode::Char('c') => dirs::config_dir(),
-                            KeyCode::Char('p') => dirs::picture_dir(),
-                            KeyCode::Char('v') => dirs::video_dir(),
-                            KeyCode::Char('f') => dirs::font_dir(),
-                            KeyCode::Char('t') => dirs::template_dir(),
-                            KeyCode::Char('r') => Some(std::path::PathBuf::from("/")),
-                            _ => None, // Si on tape une autre touche, on annule l'action
-                        };
-
-                        if let Some(new_dir) = target_dir {
-                            // Si le dossier existe, on s'y téléporte !
-                            if new_dir.exists() {
-                                state.current_dir = new_dir;
-                                // On n'oublie pas de remonter la caméra tout en haut
-                                state.selected_index = 0;
-                                state.scroll_offset = 0;
-                                state.refresh();
-                                draw(state)?;
-                            }
+                    if let Some(new_dir) = target_dir {
+                        // Si le dossier existe, on s'y téléporte !
+                        if new_dir.exists() {
+                            state.current_dir = new_dir;
+                            // On n'oublie pas de remonter la caméra tout en haut
+                            state.selected_index = 0;
+                            state.scroll_offset = 0;
+                            state.refresh();
+                            draw(state)?;
                         }
-                        continue; // On passe directement au cycle suivant sans lire les autres raccourcis
                     }
-
+                    continue; // On passe directement au cycle suivant sans lire les autres raccourcis
+                } else if state.pending_create {
+                    state.pending_create = false;
                     match &mut state.mode {
                         AppMode::Normal => {
                             match key.code {
+                                KeyCode::Char('d') => {
+                                    state.pending_create_dir = true;
+                                    state.pending_create_new_project = false;
+                                    state.pending_create_branch = false;
+                                    state.pending_create_file = false;
+                                    state.pending_create_symlink = false;
+                                    state.pending_create_connection = false;
+                                    state.mode = AppMode::Omnibar {
+                                        prefix: '+', // Le signe + indique qu'on ajoute quelque chose
+                                        input_buffer: String::new(),
+                                        receiver: None,
+                                        kill_switch: None,
+                                    };
+                                    draw(state)?;
+                                }
+                                KeyCode::Char('s') => {
+                                    state.pending_create_symlink = true;
+                                    state.pending_create_new_project = false;
+                                    state.pending_create_dir = false;
+                                    state.pending_create_branch = false;
+                                    state.pending_create_file = false;
+                                    state.pending_create_connection = false;
+                                    state.mode = AppMode::Omnibar {
+                                        prefix: '+', // Le signe + indique qu'on ajoute quelque chose
+                                        input_buffer: String::new(),
+                                        receiver: None,
+                                        kill_switch: None,
+                                    };
+                                    draw(state)?;
+                                }
+                                KeyCode::Char('h') => {
+                                    state.pending_create_hard_link = true;
+                                    state.pending_create_new_project = false;
+                                    state.pending_create_branch = false;
+                                    state.pending_create_dir = false;
+                                    state.pending_create_file = false;
+                                    state.pending_create_symlink = false;
+                                    state.pending_create_connection = false;
+                                    state.mode = AppMode::Omnibar {
+                                        prefix: '+', // Le signe + indique qu'on ajoute quelque chose
+                                        input_buffer: String::new(),
+                                        receiver: None,
+                                        kill_switch: None,
+                                    };
+                                    draw(state)?;
+                                }
+                                // jump ssh
+                                KeyCode::Char('j') => {
+                                    state.pending_create_connection = true;
+                                    state.pending_create_new_project = false;
+                                    state.pending_create_branch = false;
+                                    state.pending_create_dir = false;
+                                    state.pending_create_file = false;
+                                    state.pending_create_symlink = false;
+                                    state.mode = AppMode::Omnibar {
+                                        prefix: '+', // Le signe + indique qu'on ajoute quelque chose
+                                        input_buffer: String::new(),
+                                        receiver: None,
+                                        kill_switch: None,
+                                    };
+                                    draw(state)?;
+                                }
+                                KeyCode::Char('b') => {
+                                    state.pending_create_branch = true;
+                                    state.pending_create_new_project = false;
+                                    state.pending_create_connection = false;
+                                    state.pending_create_dir = false;
+                                    state.pending_create_file = false;
+                                    state.pending_create_symlink = false;
+                                    state.mode = AppMode::Omnibar {
+                                        prefix: '+', // Le signe + indique qu'on ajoute quelque chose
+                                        input_buffer: String::new(),
+                                        receiver: None,
+                                        kill_switch: None,
+                                    };
+                                    draw(state)?;
+                                }
+                                KeyCode::Char('f') => {
+                                    state.pending_create_file = true;
+                                    state.pending_create_new_project = false;
+                                    state.pending_create_branch = false;
+                                    state.pending_create_dir = false;
+                                    state.pending_create_symlink = false;
+                                    state.pending_create_connection = false;
+                                    state.mode = AppMode::Omnibar {
+                                        prefix: '+', // Le signe + indique qu'on ajoute quelque chose
+                                        input_buffer: String::new(),
+                                        receiver: None,
+                                        kill_switch: None,
+                                    };
+                                    draw(state)?;
+                                }
+                                KeyCode::Char('n') => {
+                                    state.pending_create_new_project = true;
+                                    state.pending_create_file = false;
+                                    state.pending_create_file = false;
+                                    state.pending_create_branch = false;
+                                    state.pending_create_dir = false;
+                                    state.pending_create_symlink = false;
+                                    state.pending_create_connection = false;
+                                    state.mode = AppMode::Omnibar {
+                                        prefix: '+', // Le signe + indique qu'on ajoute quelque chose
+                                        input_buffer: String::new(),
+                                        receiver: None,
+                                        kill_switch: None,
+                                    };
+                                    draw(state)?;
+                                }
+                                KeyCode::Char('a') => {
+                                    state.pending_create_archive = true;
+                                    state.pending_create_new_project = false;
+                                    state.pending_create_branch = false;
+                                    state.pending_create_dir = false;
+                                    state.pending_create_symlink = false;
+                                    state.pending_create_connection = false;
+                                    state.pending_create_file = false;
+                                    state.mode = AppMode::Omnibar {
+                                        prefix: '+', // Le signe + indique qu'on ajoute quelque chose
+                                        input_buffer: String::new(),
+                                        receiver: None,
+                                        kill_switch: None,
+                                    };
+                                    draw(state)?;
+                                }
+                                _ => {
+                                    continue;
+                                }
+                            }
+                        }
+                        AppMode::Omnibar {
+                            prefix: _,
+                            input_buffer: _,
+                            receiver: _,
+                            kill_switch: _,
+                        } => {}
+                    }
+                } else {
+                    match &mut state.mode {
+                        AppMode::Normal => {
+                            match key.code {
+                                KeyCode::Char('n') => {
+                                    state.pending_create = true;
+                                    continue;
+                                }
                                 KeyCode::Char('g') => {
                                     state.pending_g = true;
+                                    continue;
                                 }
                                 // --- RAFRAÎCHISSEMENT MANUEL (Nettoyer le filtre) ---
                                 KeyCode::F(5) => {
@@ -417,7 +605,7 @@ impl MillerState {
                             }
                         }
                         AppMode::Omnibar {
-                            prefix: _,
+                            prefix,
                             input_buffer,
                             receiver: _,
                             kill_switch,
@@ -433,6 +621,80 @@ impl MillerState {
                                     draw(state)?;
                                 }
                                 KeyCode::Enter => {
+                                    if *prefix == '+' && !input_buffer.to_string().is_empty() {
+                                        // On construit le chemin complet à partir du dossier courant
+                                        let target_path = state.current_dir.join(&input_buffer);
+
+                                        if state.pending_create_dir {
+                                            // S'il y a un slash à la fin, on crée un dossier (et ses parents si besoin)
+                                            let _ = std::fs::create_dir_all(target_path);
+                                        } else if state.pending_create_file {
+                                            // Sinon, on crée un fichier vide
+                                            let _ = std::fs::File::create(target_path);
+                                        } else if state.pending_create_hard_link {
+                                            fs::hard_link(
+                                                state
+                                                    .current_entries
+                                                    .get(state.selected_index)
+                                                    .expect("failed to get original")
+                                                    .name
+                                                    .as_str(),
+                                                input_buffer.as_str(),
+                                            )
+                                            .expect("");
+                                        } else if state.pending_create_symlink {
+                                            symlink(
+                                                state
+                                                    .current_entries
+                                                    .get(state.selected_index)
+                                                    .expect("")
+                                                    .name
+                                                    .as_str(),
+                                                input_buffer.as_str(),
+                                            )
+                                            .expect("faield to create symlink");
+                                        } else if state.pending_create_archive {
+                                            let archive_path =
+                                                state.current_dir.join(&input_buffer);
+                                            // 2. On branche le compresseur Gzip et le constructeur Tar
+                                            let enc = GzEncoder::new(
+                                                File::create(archive_path)
+                                                    .expect("failed to create file"),
+                                                Compression::default(),
+                                            );
+                                            let mut builder = tar::Builder::new(enc);
+                                            let selected = state
+                                                .current_entries
+                                                .get(state.selected_index)
+                                                .expect("failed to get selected path");
+                                            // On récupère le nom de l'élément cible pour structurer l'archive proprement
+                                            let item_name = state
+                                                .current_dir
+                                                .as_path()
+                                                .file_name()
+                                                .unwrap_or_default();
+
+                                            // 3. La logique diffère si c'est un dossier ou un fichier unique
+                                            if selected.is_dir {
+                                                // S'il y a une erreur de permissions en lisant le dossier, on l'ignore silencieusement avec let _
+                                                let _ = builder
+                                                    .append_dir_all(item_name, &selected.path);
+                                            } else if let Ok(mut f) =
+                                                std::fs::File::open(&selected.path)
+                                            {
+                                                let _ = builder.append_file(item_name, &mut f);
+                                            }
+
+                                            // 4. On finalise l'écriture de l'archive
+                                            let _ = builder.into_inner();
+                                        }
+                                        state.refresh();
+                                        state.pending_create_archive = false;
+                                        state.pending_create_dir = false;
+                                        state.pending_create_file = false;
+                                        state.pending_create_symlink = false;
+                                        state.pending_create_hard_link = false;
+                                    }
                                     // On valide, on laisse le worker finir s'il n'a pas terminé,
                                     // et on fige les résultats
                                     state.mode = AppMode::Normal;
@@ -451,9 +713,10 @@ impl MillerState {
                         }
                     }
                 }
+            } else {
+                continue;
             }
         }
-
         Ok(())
     }
     /// Glissement vers la gauche (Revenir au parent)

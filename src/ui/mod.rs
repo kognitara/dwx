@@ -43,7 +43,9 @@ fn echo(
 }
 pub fn draw(state: &mut MillerState) -> std::io::Result<()> {
     let mut stdout = stdout();
-
+    // On efface l'écran à chaque frame et on cache le curseur
+    stdout.queue(Clear(ClearType::All))?;
+    stdout.queue(Hide)?;
     // 1. On récupère la taille dynamique du terminal
     let (cols, rows) = size()?;
 
@@ -52,16 +54,28 @@ pub fn draw(state: &mut MillerState) -> std::io::Result<()> {
     let col2_w = (cols as f32 * 0.30) as u16;
     let col3_w = cols.saturating_sub(col1_w).saturating_sub(col2_w);
 
-    // On efface l'écran à chaque frame et on cache le curseur
-    stdout.queue(Clear(ClearType::All))?;
-    stdout.queue(Hide)?;
-
     // --- COLONNE 1 : LE PARENT ---
-    for (i, item) in state.parent_entries.iter().take(rows as usize).enumerate() {
+    // On trouve le chemin du parent direct
+    let parent_path = state.current_dir.parent().unwrap_or(&state.current_dir);
+
+    // On va chercher son offset dans l'historique (0 par défaut si jamais visité)
+    let parent_scroll_offset = state
+        .history
+        .get(parent_path)
+        .map(|s| s.scroll_offset)
+        .unwrap_or(0);
+
+    // On applique le skip avec l'offset historique !
+    for (i, item) in state
+        .parent_entries
+        .iter()
+        .skip(parent_scroll_offset)
+        .take(rows as usize)
+        .enumerate()
+    {
         stdout.queue(MoveTo(0, i as u16))?;
         let display_name = format_item(item, col1_w);
 
-        // VRAIE CONDITION : On compare le chemin de l'item avec le dossier courant de l'état
         let is_current_parent = item.path == state.current_dir;
         echo(
             &mut stdout,
@@ -72,6 +86,29 @@ pub fn draw(state: &mut MillerState) -> std::io::Result<()> {
             Color::Black,
         )?;
     }
+
+    // 3. On applique le skip() comme pour la Colonne 2
+    for (i, item) in state
+        .parent_entries
+        .iter()
+        .skip(parent_scroll_offset)
+        .take(rows as usize)
+        .enumerate()
+    {
+        stdout.queue(MoveTo(0, i as u16))?;
+        let display_name = format_item(item, col1_w);
+
+        let is_current_parent = item.path == state.current_dir;
+        echo(
+            &mut stdout,
+            item,
+            &display_name,
+            is_current_parent,
+            Color::Blue,
+            Color::Black,
+        )?;
+    }
+
     // --- COLONNE 2 : LE DOSSIER COURANT (Focus actif filtré) ---
     // Au lieu de lire current_entries, on lit notre calque filtered_indices !
     // On garde une petite marge en bas (rows - 1) pour ne pas écraser la barre de recherche
@@ -185,9 +222,14 @@ pub fn draw(state: &mut MillerState) -> std::io::Result<()> {
         }
         Preview::File(lines) => {
             // Affichage du code source coloré par syntect
+            let max_preview_width = col3_w.saturating_sub(1) as usize;
+
             for (i, line) in lines.iter().take(rows as usize).enumerate() {
                 stdout.queue(MoveTo(col1_w + col2_w, i as u16))?;
-                stdout.queue(Print(line))?;
+
+                // On coupe violemment la ligne si elle dépasse la largeur de la colonne 3
+                let truncated_line: String = line.chars().take(max_preview_width).collect();
+                stdout.queue(Print(truncated_line))?;
             }
         }
         Preview::Empty => {}
