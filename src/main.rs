@@ -35,8 +35,8 @@ fn main() -> ExitCode {
         execute!(stdout(), EnterAlternateScreen, Hide).expect("faiedl to enteralternate screen");
         // On désactive l'écho des touches et on lit le clavier en temps réel (Raw Mode)
         enable_raw_mode().expect("failed to enabled raw mode");
-        let state = MillerState::new(current_dir().expect("faield to get current dir"));
-        let app_result = MillerState::run(state);
+        let mut state = MillerState::new(current_dir().expect("faield to get current dir"));
+        let app_result = MillerState::run(&mut state);
         disable_raw_mode().expect("failed to disabled raw mode");
         execute!(stdout(), Show, LeaveAlternateScreen).expect("failed to exit alternate screen");
         if let Err(err) = app_result {

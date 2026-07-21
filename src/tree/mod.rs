@@ -1,24 +1,37 @@
 use crate::ui::draw;
-use crossterm::event::{Event, KeyCode, KeyEventKind, read};
-use crossterm::{
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+use crossterm::event::{Event, KeyCode, KeyEventKind, poll, read};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ignore::WalkBuilder;
 use is_executable::IsExecutable;
-use std::env;
-use std::fs::{self};
 use std::fs::File;
-use std::io::BufRead;
+use std::fs::{self};
 use std::io::BufReader;
-use std::io::stdout;
+use std::io::{BufRead, stdout};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
+use std::{env, thread};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use syntect::util::as_24_bit_terminal_escaped;
 
+pub enum AppMode {
+    Normal,
+    Omnibar {
+        prefix: char,
+        input_buffer: String,
+        receiver: Option<Receiver<FileItem>>,
+        kill_switch: Option<Arc<AtomicBool>>,
+    },
+}
 pub enum Preview {
     Dir(Vec<FileItem>),
     File(Vec<String>), // Lignes de texte pré-formatées avec les couleurs ANSI
@@ -26,12 +39,15 @@ pub enum Preview {
 }
 pub struct MillerState {
     pub current_dir: PathBuf,
-
+    pub filtered_indices: Vec<usize>, // Le calque : juste une liste de chiffres (les index)
+    pub mode: AppMode,
     // Les 3 colonnes d'affichage
     pub parent_entries: Vec<FileItem>, // Colonne de gauche (Contexte)
     pub current_entries: Vec<FileItem>, // Colonne centrale (Focus)
     pub preview: Preview,
     pub selected_index: usize,
+    pub scroll_offset: usize,
+    pub pending_g: bool,
 }
 
 impl MillerState {
@@ -42,11 +58,139 @@ impl MillerState {
             current_entries: Vec::new(),
             selected_index: 0,
             preview: Preview::Empty,
+            filtered_indices: Vec::new(),
+            mode: AppMode::Normal,
+            scroll_offset: 0,
+            pending_g: false,
         };
-
         state.refresh(); // On charge les données initiales
         state
     }
+    pub fn update_preview(&mut self) {
+        self.preview = Preview::Empty;
+
+        // On passe par le calque pour trouver le VRAI index du fichier
+        if let Some(&actual_index) = self.filtered_indices.get(self.selected_index)
+            && let Some(selected) = self.current_entries.get(actual_index)
+        {
+            if selected.is_dir {
+                self.preview = Preview::Dir(Self::read_dir_entries(&selected.path));
+            } else {
+                self.preview = Preview::File(Self::read_and_highlight(&selected.path));
+            }
+        }
+    }
+    fn update_search(state: &mut MillerState) {
+        // 1. On extrait les données de l'Omnibar avant le match pour éviter de bloquer l'état (Borrow Checker)
+        let (prefix, query) = match &state.mode {
+            AppMode::Omnibar {
+                prefix,
+                input_buffer,
+                ..
+            } => (*prefix, input_buffer.to_lowercase()),
+            _ => return,
+        };
+
+        // 2. Le routeur de recherche
+        match prefix {
+            '/' => {
+                // --- STRATÉGIE 1 : FILTRE LOCAL (Synchrone & Instantané) ---
+                // On ne touche SURTOUT PAS à current_entries ni aux threads.
+                if query.is_empty() {
+                    // Si on a tout effacé, le calque redevient complet
+                    state.filtered_indices = (0..state.current_entries.len()).collect();
+                } else {
+                    // Sinon, on filtre
+                    state.filtered_indices = state
+                        .current_entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| item.name.to_lowercase().contains(&query))
+                        .map(|(i, _)| i)
+                        .collect();
+                }
+                // On remet la caméra en haut
+                state.selected_index = 0;
+                state.scroll_offset = 0;
+            }
+            '?' => {
+                // --- STRATÉGIE 2 : RECHERCHE RÉCURSIVE (Asynchrone via Threads) ---
+                if let AppMode::Omnibar {
+                    receiver,
+                    kill_switch,
+                    ..
+                } = &mut state.mode
+                {
+                    // 1. Tuer l'ancienne recherche
+                    if let Some(ks) = kill_switch {
+                        ks.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+
+                    // 2. Vider les listes pour accueillir les nouveaux résultats
+                    state.current_entries.clear();
+                    state.filtered_indices.clear();
+                    state.selected_index = 0;
+                    state.scroll_offset = 0;
+
+                    // 3. Relancer un thread si on a tapé quelque chose
+                    if !query.is_empty() {
+                        let (new_rx, new_ks) = Self::spawn_search(query, state.current_dir.clone());
+                        *receiver = Some(new_rx);
+                        *kill_switch = Some(new_ks);
+                    } else {
+                        *receiver = None;
+                        *kill_switch = None;
+                    }
+                }
+            }
+            _ => {} // Prêt pour accueillir d'autres préfixes plus tard (ex: '!')
+        }
+
+        // 3. On demande un redessin immédiat
+        let _ = crate::ui::draw(state);
+    }
+
+    pub fn spawn_search(
+        query: String,
+        start_dir: std::path::PathBuf,
+    ) -> (Receiver<FileItem>, Arc<AtomicBool>) {
+        // 1. Création du canal de communication
+        let (tx, rx) = mpsc::channel();
+
+        // 2. Création du Kill Switch (partagé entre le main thread et le worker)
+        let kill_switch = Arc::new(AtomicBool::new(false));
+        let worker_kill = Arc::clone(&kill_switch);
+
+        // 3. Lancement du thread secondaire
+        thread::spawn(move || {
+            // WalkBuilder gère le multi-threading interne et les .gitignore
+            let walker = WalkBuilder::new(start_dir).build();
+
+            for result in walker.flatten() {
+                // À chaque fichier, le worker regarde si on a ordonné son exécution
+                if worker_kill.load(Ordering::Relaxed) {
+                    break; // Le thread se suicide silencieusement
+                }
+                // On ignore les erreurs de permission
+                let path = result.path();
+                let name = result.file_name().to_string_lossy().to_string();
+
+                // Filtrage exact strict
+                if name.to_lowercase().contains(&query) {
+                    let item = FileItem::from_path(path.to_path_buf());
+
+                    // On envoie le fichier au thread principal.
+                    // Si le canal est fermé (ex: l'utilisateur a quitté dwx), on arrête.
+                    if tx.send(item).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        // On retourne le récepteur et la télécommande du kill switch au thread principal
+        (rx, kill_switch)
+    }
+
     /// Lit un fichier et retourne ses lignes avec la coloration syntaxique ANSI
     fn read_and_highlight(path: &Path) -> Vec<String> {
         // Initialisation de syntect (ces objets pourraient être mis en cache dans MillerState pour encore plus de perfs)
@@ -105,80 +249,207 @@ impl MillerState {
         entries
     }
     pub fn enter_dir(&mut self) {
-        // Clippy est content : on fait tout sur une seule ligne
-        if let Some(selected) = self.current_entries.get(self.selected_index)
-            && selected.is_dir
+        if let Some(&actual_index) = self.filtered_indices.get(self.selected_index)
+            && let Some(selected) = self.current_entries.get(actual_index)
         {
             self.current_dir = selected.path.clone();
             self.selected_index = 0;
             self.refresh();
         }
     }
-
-    // On passe ton state initialisé à cette fonction
-    pub fn run(mut state: MillerState) -> std::io::Result<()> {
-        // On dessine l'état initial une première fois avant de bloquer sur read()
-        draw(&state)?;
+    pub fn run(state: &mut MillerState) -> std::io::Result<()> {
+        draw(state)?;
 
         loop {
-            // L'application attend ici jusqu'à ce qu'une touche soit pressée
-            if let Event::Key(key) = read()? {
-                // Sécurité : on ignore les événements de relâchement de touche
-                // pour éviter que l'action ne s'exécute deux fois sur certains systèmes
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            let mut needs_redraw = false;
+            state.update_preview();
+            // --- 1. LECTURE DU STREAMING EN ARRIÈRE-PLAN ---
+            // Si on est en mode Omnibar, on vérifie si le Worker nous a envoyé des fichiers
+            if let AppMode::Omnibar {
+                receiver: Some(rx), ..
+            } = &state.mode
+            {
+                // try_recv() lit le canal sans bloquer. S'il est vide, on passe à la suite.
+                while let Ok(item) = &rx.try_recv() {
+                    // On ajoute le fichier trouvé à notre source de vérité
+                    state.current_entries.push(item.clone());
+
+                    // On met à jour le calque (le nouvel élément est à la fin)
+                    state.filtered_indices.push(state.current_entries.len() - 1);
+                    // NOUVEAU : Si c'est le tout premier fichier trouvé, on charge son aperçu
+                    needs_redraw = true;
                 }
+            }
+            // Si de nouveaux fichiers sont arrivés, on met à jour l'écran en direct
+            if needs_redraw {
+                draw(state)?;
+            }
 
-                match key.code {
-                    // --- QUITTER ---
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-
-                    // --- NAVIGATION VERTICALE (Haut/Bas) ---
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        state.move_down();
-                        draw(&state)?; // On redessine après chaque changement
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        state.move_up();
-                        draw(&state)?;
+            // --- 2. ÉCOUTE DU CLAVIER (Non-bloquant, 16ms = ~60 FPS) ---
+            if poll(Duration::from_millis(16))? {
+                if let Event::Key(key) = read()? {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
                     }
 
-                    // --- GLISSEMENT DROITE (Entrer / Espace) ---
-                    KeyCode::Char('l') | KeyCode::Right | KeyCode::Char(' ') => {
-                        state.enter_dir();
-                        draw(&state)?;
+                    if state.pending_g {
+                        state.pending_g = false; // On désarme le piège immédiatement
+
+                        let target_dir = match key.code {
+                            KeyCode::Char('h') => dirs::home_dir(),
+                            KeyCode::Char('D') => dirs::download_dir(),
+                            KeyCode::Char('d') => dirs::document_dir(),
+                            KeyCode::Char('a') => dirs::audio_dir(),
+                            KeyCode::Char('b') => dirs::executable_dir(),
+                            KeyCode::Char('c') => dirs::config_dir(),
+                            KeyCode::Char('p') => dirs::picture_dir(),
+                            KeyCode::Char('v') => dirs::video_dir(),
+                            KeyCode::Char('f') => dirs::font_dir(),
+                            KeyCode::Char('t') => dirs::template_dir(),
+                            KeyCode::Char('r') => Some(std::path::PathBuf::from("/")),
+                            _ => None, // Si on tape une autre touche, on annule l'action
+                        };
+
+                        if let Some(new_dir) = target_dir {
+                            // Si le dossier existe, on s'y téléporte !
+                            if new_dir.exists() {
+                                state.current_dir = new_dir;
+                                // On n'oublie pas de remonter la caméra tout en haut
+                                state.selected_index = 0;
+                                state.scroll_offset = 0;
+                                state.refresh();
+                                draw(state)?;
+                            }
+                        }
+                        continue; // On passe directement au cycle suivant sans lire les autres raccourcis
                     }
 
-                    // --- GLISSEMENT GAUCHE (Retour) ---
-                    KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
-                        state.go_parent();
-                        draw(&state)?;
-                    }
+                    match &mut state.mode {
+                        AppMode::Normal => {
+                            match key.code {
+                                KeyCode::Char('g') => {
+                                    state.pending_g = true;
+                                }
+                                // --- RAFRAÎCHISSEMENT MANUEL (Nettoyer le filtre) ---
+                                KeyCode::F(5) => {
+                                    state.refresh();
+                                    draw(state)?;
+                                }
+                                KeyCode::Char('o') | KeyCode::Enter => {
+                                    if let Some(selected) =
+                                        state.current_entries.get(state.selected_index)
+                                    {
+                                        let mut stdout = stdout();
+                                        // 1. Préparation de l'éditeur (hx par défaut)
+                                        let editor =
+                                            env::var("EDITOR").unwrap_or_else(|_| "hx".to_string());
 
-                    // --- HANDOFF (Ouvrir l'éditeur) ---
-                    KeyCode::Char('o') | KeyCode::Enter => {
-                        if let Some(selected) = state.current_entries.get(state.selected_index) {
-                            // 1. Préparation de l'éditeur (hx par défaut)
-                            let editor = env::var("EDITOR").unwrap_or_else(|_| "hx".to_string());
+                                        // 2. On rend le terminal à l'OS (Crucial !)
+                                        disable_raw_mode()?;
+                                        execute!(stdout, LeaveAlternateScreen)?;
 
-                            // 2. On rend le terminal à l'OS (Crucial !)
-                            disable_raw_mode()?;
-                            execute!(stdout(), LeaveAlternateScreen)?;
+                                        // 3. On lance l'éditeur et on bloque dwx en attendant qu'il se ferme
+                                        let _ =
+                                            Command::new(&editor).arg(&selected.path).status()?;
 
-                            // 3. On lance l'éditeur et on bloque dwx en attendant qu'il se ferme
-                            let _ = Command::new(&editor).arg(&selected.path).status()?;
+                                        // 4. L'éditeur est fermé, on reprend le contrôle du terminal
+                                        execute!(stdout, EnterAlternateScreen)?;
+                                        enable_raw_mode()?;
 
-                            // 4. L'éditeur est fermé, on reprend le contrôle du terminal
-                            execute!(stdout(), EnterAlternateScreen)?;
-                            enable_raw_mode()?;
+                                        // 5. On rafraîchit l'état au cas où tu aurais créé/supprimé/renommé
+                                        // des choses depuis ton éditeur, et on redessine l'interface
+                                        state.refresh();
+                                        draw(state)?;
+                                    }
+                                }
+                                KeyCode::Char('q') | KeyCode::Esc => break,
+                                KeyCode::Char('j') | KeyCode::Down => {
+                                    state.move_down(state.scroll_offset);
+                                    draw(state)?; // On redessine après chaque changement
+                                }
+                                KeyCode::Char('k') | KeyCode::Up => {
+                                    state.move_up();
+                                    draw(state)?;
+                                }
+                                // --- GLISSEMENT GAUCHE (Retour) ---
+                                KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+                                    state.go_parent();
+                                    draw(state)?;
+                                }
 
-                            // 5. On rafraîchit l'état au cas où tu aurais créé/supprimé/renommé
-                            // des choses depuis ton éditeur, et on redessine l'interface
-                            state.refresh();
-                            draw(&state)?;
+                                // --- GLISSEMENT DROITE (Entrer / Espace) ---
+                                KeyCode::Char('l') | KeyCode::Right | KeyCode::Char(' ') => {
+                                    state.enter_dir();
+                                    draw(state)?;
+                                }
+                                KeyCode::Char('/') => {
+                                    // On bascule en recherche récursive !
+                                    // On vide les listes pour préparer les résultats vierges
+                                    state.selected_index = 0;
+                                    state.scroll_offset = 0;
+
+                                    state.mode = AppMode::Omnibar {
+                                        prefix: '/',
+                                        input_buffer: String::new(),
+                                        receiver: None,
+                                        kill_switch: None,
+                                    };
+                                    draw(state)?;
+                                }
+                                // ... Tes anciens raccourcis (j, k, h, l, o) restent ici ...
+                                KeyCode::Char('?') => {
+                                    // On bascule en recherche récursive !
+                                    // On vide les listes pour préparer les résultats vierges
+                                    state.current_entries.clear();
+                                    state.filtered_indices.clear();
+                                    state.selected_index = 0;
+                                    state.scroll_offset = 0;
+
+                                    state.mode = AppMode::Omnibar {
+                                        prefix: '?',
+                                        input_buffer: String::new(),
+                                        receiver: None,
+                                        kill_switch: None,
+                                    };
+                                    draw(state)?;
+                                }
+                                _ => {}
+                            }
+                        }
+                        AppMode::Omnibar {
+                            prefix: _,
+                            input_buffer,
+                            receiver: _,
+                            kill_switch,
+                        } => {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    // 1. Tuer la recherche en cours s'il y en a une
+                                    if let Some(ks) = kill_switch {
+                                        ks.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    // 2. On revient à la normale, on recharge le dossier courant
+                                    state.mode = AppMode::Normal;
+                                    draw(state)?;
+                                }
+                                KeyCode::Enter => {
+                                    // On valide, on laisse le worker finir s'il n'a pas terminé,
+                                    // et on fige les résultats
+                                    state.mode = AppMode::Normal;
+                                    draw(state)?;
+                                }
+                                KeyCode::Char(c) => {
+                                    input_buffer.push(c);
+                                    Self::update_search(state);
+                                }
+                                KeyCode::Backspace => {
+                                    input_buffer.pop();
+                                    Self::update_search(state);
+                                }
+                                _ => {}
+                            }
                         }
                     }
-                    _ => {}
                 }
             }
         }
@@ -210,10 +481,10 @@ impl MillerState {
             } else {
                 self.selected_index = 0;
             }
-
             self.refresh(); // Un second rafraîchissement pour mettre à jour la colonne d'aperçu
         }
     }
+
     /// Met à jour les 3 colonnes en fonction du `current_dir` et du `selected_index`
     pub fn refresh(&mut self) {
         // 1. Colonne centrale : On lit le dossier actuel
@@ -243,16 +514,19 @@ impl MillerState {
                 self.preview = Preview::File(Self::read_and_highlight(&selected.path));
             }
         }
+        self.filtered_indices = (0..self.current_entries.len()).collect();
     }
 
     // Déplacement vers le bas (j)
-    pub fn move_down(&mut self) {
-        if !self.current_entries.is_empty() && self.selected_index < self.current_entries.len() - 1
-        {
+    // Déplacement vers le bas (j)
+    pub fn move_down(&mut self, visible_rows: usize) {
+        // CORRECTION : On bloque le curseur en fonction de la taille du filtre, pas du dossier entier !
+        if self.selected_index + 1 < self.filtered_indices.len() {
             self.selected_index += 1;
-            // On rafraîchit seulement si la nouvelle sélection est un dossier
-            // pour mettre à jour la colonne de droite
-            self.refresh();
+            if self.selected_index >= self.scroll_offset + visible_rows {
+                self.scroll_offset += 1;
+            }
+            self.update_preview(); // <--- On actualise l'aperçu !
         }
     }
 
@@ -260,7 +534,10 @@ impl MillerState {
     pub fn move_up(&mut self) {
         if self.selected_index > 0 {
             self.selected_index -= 1;
-            self.refresh();
+            if self.selected_index < self.scroll_offset {
+                self.scroll_offset -= 1;
+            }
+            self.update_preview(); // <--- On actualise l'aperçu !
         }
     }
 }

@@ -34,14 +34,14 @@ fn echo(
         output.queue(SetBackgroundColor(Color::Reset))?;
         output.queue(SetForegroundColor(fg_color))?;
     }
-    
+
     output.queue(Print(Bold))?;
     // 3. Afficher le texte et réinitialiser
     output.queue(Print(display_name))?;
     output.queue(ResetColor)?;
     Ok(())
 }
-pub fn draw(state: &MillerState) -> std::io::Result<()> {
+pub fn draw(state: &mut MillerState) -> std::io::Result<()> {
     let mut stdout = stdout();
 
     // 1. On récupère la taille dynamique du terminal
@@ -72,43 +72,67 @@ pub fn draw(state: &MillerState) -> std::io::Result<()> {
             Color::Black,
         )?;
     }
+    // --- COLONNE 2 : LE DOSSIER COURANT (Focus actif filtré) ---
+    // Au lieu de lire current_entries, on lit notre calque filtered_indices !
+    // On garde une petite marge en bas (rows - 1) pour ne pas écraser la barre de recherche
+    let visible_rows = rows.saturating_sub(1) as usize;
 
-    // --- COLONNE 2 : LE DOSSIER COURANT (Focus actif) ---
-    for (i, item) in state.current_entries.iter().take(rows as usize).enumerate() {
+    for (i, &actual_index) in state
+        .filtered_indices
+        .iter()
+        .skip(state.scroll_offset)
+        .take(visible_rows)
+        .enumerate()
+    {
         stdout.queue(MoveTo(col1_w, i as u16))?;
-        let display_name = format_item(item, col2_w);
 
-        // Couleur de focus standard (Gris foncé ou Blanc, selon tes préférences)
-        if item.is_dir {
-            echo(
-                &mut stdout,
-                item,
-                &display_name,
-                i == state.selected_index,
-                Color::Blue,
-                Color::Black,
-            )?;
-        } else if item.is_executable {
-            echo(
-                &mut stdout,
-                item,
-                &display_name,
-                i == state.selected_index,
-                Color::Green,
-                Color::Black,
-            )?;
-        } else if item.is_file {
-            echo(
-                &mut stdout,
-                item,
-                &display_name,
-                i == state.selected_index,
-                Color::White,
-                Color::Black,
-            )?;
+        // On récupère le VRAI fichier en utilisant l'index du calque
+        if let Some(item) = state.current_entries.get(actual_index) {
+            let display_name = format_item(item, col2_w);
+
+            // Le fichier est sélectionné si sa position DANS LE CALQUE correspond au selected_index
+            let is_selected = (i + state.scroll_offset) == state.selected_index;
+
+            // Ton ancienne logique de couleur reste la même
+            if item.is_dir {
+                echo(
+                    &mut stdout,
+                    item,
+                    &display_name,
+                    is_selected,
+                    Color::Blue,
+                    Color::Black,
+                )?;
+            } else if item.is_executable {
+                echo(
+                    &mut stdout,
+                    item,
+                    &display_name,
+                    is_selected,
+                    Color::Green,
+                    Color::Black,
+                )?;
+            } else if item.is_file {
+                echo(
+                    &mut stdout,
+                    item,
+                    &display_name,
+                    is_selected,
+                    Color::White,
+                    Color::Black,
+                )?;
+            } else {
+                echo(
+                    &mut stdout,
+                    item,
+                    &display_name,
+                    is_selected,
+                    Color::Black,
+                    Color::White,
+                )?;
+            }
         }
     }
-
     // --- COLONNE 3 : L'APERÇU ---
     // (Ancienne boucle preview_entries supprimée ici pour éviter les conflits d'affichage)
 
@@ -168,7 +192,30 @@ pub fn draw(state: &MillerState) -> std::io::Result<()> {
         }
         Preview::Empty => {}
     }
+    // --- L'OMNIBAR (Barre de recherche) ---
+    // Si on est en mode saisie, on dessine la barre tout en bas de l'écran
+    if let crate::tree::AppMode::Omnibar {
+        prefix,
+        input_buffer,
+        receiver: _,
+        kill_switch: _,
+    } = &state.mode
+    {
+        // On se place sur la toute dernière ligne du terminal
+        stdout.queue(MoveTo(0, rows.saturating_sub(1)))?;
 
+        // Un petit style visuel distinct (tu peux l'ajuster pour ton thème sombre)
+        stdout.queue(SetBackgroundColor(Color::White))?;
+        stdout.queue(SetForegroundColor(Color::Black))?;
+        stdout.queue(Print(Bold))?;
+
+        // On remplit la ligne d'espaces pour que le fond gris aille jusqu'au bout
+        let prompt = format!("{} {} ", prefix, input_buffer);
+        let padding = " ".repeat(cols.saturating_sub(prompt.chars().count() as u16) as usize);
+
+        stdout.queue(Print(format!("{}{}", prompt, padding)))?;
+        stdout.queue(ResetColor)?;
+    }
     // On s'assure de tout réinitialiser et on pousse l'affichage à l'écran
     stdout.queue(ResetColor)?;
     stdout.flush()?;
