@@ -370,6 +370,15 @@ impl MillerState {
                     match &mut state.mode {
                         AppMode::Normal => {
                             match key.code {
+                                KeyCode::Char('m') => {
+                                    state.mode = AppMode::Omnibar {
+                                        prefix: 'm', // Le préfixe 'm' indique qu'on veut lire un manuel
+                                        input_buffer: String::new(),
+                                        receiver: None,
+                                        kill_switch: None,
+                                    };
+                                    draw(state)?;
+                                }
                                 KeyCode::Char('d') => {
                                     state.pending_create_dir = true;
                                     state.pending_create_new_project = false;
@@ -621,7 +630,40 @@ impl MillerState {
                                     draw(state)?;
                                 }
                                 KeyCode::Enter => {
-                                    if *prefix == '+' && !input_buffer.to_string().is_empty() {
+                                    if *prefix == 'm' && !input_buffer.trim().is_empty() {
+                                        let mut stdout = std::io::stdout();
+
+                                        // 1. On rend l'affichage au système
+                                        crossterm::terminal::disable_raw_mode()?;
+                                        crossterm::execute!(
+                                            stdout,
+                                            crossterm::terminal::LeaveAlternateScreen
+                                        )?;
+
+                                        // 2. L'astuce pour les sections : on découpe le texte avec split_whitespace()
+                                        // Si tu tapes "3 printf", ça devient ["3", "printf"]
+                                        let args: Vec<&str> =
+                                            input_buffer.split_whitespace().collect();
+
+                                        // 3. On lance la commande man avec les arguments
+                                        let _ = std::process::Command::new("man")
+                                            .args(&args)
+                                            .status()?;
+
+                                        // 4. Tu as quitté le man, on reprend le contrôle de l'interface
+                                        crossterm::execute!(
+                                            stdout,
+                                            crossterm::terminal::EnterAlternateScreen
+                                        )?;
+                                        crossterm::terminal::enable_raw_mode()?;
+
+                                        // On nettoie l'état et on redessine
+                                        state.mode = AppMode::Normal;
+                                        state.refresh();
+                                        let _ = draw(state);
+                                        continue;
+                                    } else if *prefix == '+' && !input_buffer.to_string().is_empty()
+                                    {
                                         // On construit le chemin complet à partir du dossier courant
                                         let target_path = state.current_dir.join(&input_buffer);
 
