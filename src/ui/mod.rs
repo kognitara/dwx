@@ -1,12 +1,13 @@
+use crate::tree::{FileItem, MillerState, Preview};
 use crossterm::{
     QueueableCommand,
     cursor::{Hide, MoveTo},
     style::{Attribute::Bold, Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{Clear, ClearType, size},
 };
+use devicons::FileIcon;
 use std::io::{Write, stdout};
 
-use crate::tree::{FileItem, MillerState, Preview};
 fn echo(
     output: &mut std::io::Stdout,
     item: &FileItem,
@@ -15,7 +16,6 @@ fn echo(
     hover_bg_color: Color,
     hover_fg_color: Color,
 ) -> std::io::Result<()> {
-    // 1. Définir la couleur du texte façon "Ranger"
     let fg_color = if item.is_symlink {
         Color::Cyan
     } else if item.is_dir {
@@ -23,10 +23,11 @@ fn echo(
     } else if item.is_executable {
         Color::Green
     } else {
-        Color::Reset // Fichier standard avec la couleur par défaut du terminal
+        Color::Reset
     };
+    let icon = FileIcon::from(item.path.canonicalize().expect("failed"));
 
-    // 2. Appliquer la couleur de fond si c'est sélectionné
+    // 1. On applique les couleurs pour dessiner l'icône
     if hover {
         output.queue(SetBackgroundColor(hover_bg_color))?;
         output.queue(SetForegroundColor(hover_fg_color))?;
@@ -36,11 +37,25 @@ fn echo(
     }
 
     output.queue(Print(Bold))?;
+    output.queue(Print(format!(" {} ", icon.icon)))?;
+
+    // --- CORRECTION : RÉ-APPLICATION DES COULEURS ---
+    // On force la remise des couleurs car devicons vient de tout réinitialiser
+    if hover {
+        output.queue(SetBackgroundColor(hover_bg_color))?;
+        output.queue(SetForegroundColor(hover_fg_color))?;
+    } else {
+        output.queue(SetBackgroundColor(Color::Reset))?;
+        output.queue(SetForegroundColor(fg_color))?;
+    }
+    // ------------------------------------------------
+
     // 3. Afficher le texte et réinitialiser
     output.queue(Print(display_name))?;
     output.queue(ResetColor)?;
     Ok(())
 }
+
 pub fn draw(state: &mut MillerState) -> std::io::Result<()> {
     let mut stdout = stdout();
     // On efface l'écran à chaque frame et on cache le curseur
@@ -265,22 +280,18 @@ pub fn draw(state: &mut MillerState) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Formate le nom d'un fichier pour qu'il rentre exactement dans la largeur de la colonne
 fn format_item(item: &FileItem, max_width: u16) -> String {
-    // On retire 1 pour créer une gouttière d'espacement entre les colonnes
-    let display_width = max_width.saturating_sub(1) as usize;
+    // CORRECTION : On retire 1 pour la gouttière ET 3 pour l'icône (" {} ")
+    let display_width = max_width.saturating_sub(4) as usize;
     let name = item.name.clone();
 
     let char_count = name.chars().count();
 
     if char_count > display_width {
-        // On coupe si c'est trop long
         let mut truncated: String = name.chars().take(display_width.saturating_sub(1)).collect();
         truncated.push('…');
         truncated
     } else {
-        // Le secret est ici : on calcule et on répète MANUELLEMENT les espaces.
-        // Crossterm sera obligé de peindre le fond sur chaque espace.
         let spaces_needed = display_width - char_count;
         let padding = " ".repeat(spaces_needed);
         format!("{}{}", name, padding)
