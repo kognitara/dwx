@@ -1,8 +1,10 @@
 use crossterm::{
     cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEventKind},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    execute, queue,
+    terminal::{
+        Clear, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    },
 };
 use std::io::{self, stdout};
 use std::time::Duration;
@@ -164,9 +166,9 @@ fn main() -> io::Result<()> {
 
                         // Valider la recherche
                         KeyCode::Enter => {
+                            queue!(stdout, Clear(crossterm::terminal::ClearType::All)).unwrap();
                             workspace.mode = AppMode::Normal;
                         }
-
                         // Effacer un caractère
                         KeyCode::Backspace => {
                             input_buffer.pop();
@@ -180,11 +182,14 @@ fn main() -> io::Result<()> {
                             // Si on est en mode recherche ('/'), on peut filtrer en temps réel ici !
                             match prefix.to_string().as_str() {
                                 "/" => {
+                                    queue!(stdout, Clear(crossterm::terminal::ClearType::All))
+                                        .unwrap();
                                     workspace.miller.filter(input_buffer.as_str());
                                 }
                                 "?" => {
+                                    queue!(stdout, Clear(crossterm::terminal::ClearType::All))
+                                        .unwrap();
                                     workspace.search_id += 1;
-
                                     // 2. On vide VRAIMENT la liste juste avant de lancer la recherche
                                     workspace.miller.current_entries.clear();
                                     workspace.miller.filtered_indices.clear();
@@ -212,6 +217,5 @@ fn main() -> io::Result<()> {
     execute!(stdout, Show)?;
     execute!(stdout, LeaveAlternateScreen)?;
     disable_raw_mode()?;
-
     Ok(())
 }

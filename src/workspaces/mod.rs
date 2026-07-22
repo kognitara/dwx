@@ -1,6 +1,9 @@
 use crate::bus::{InspectorCommand, WorkerEvent};
 use crate::tree::{FileItem, MillerState};
+use crossterm::queue;
+use crossterm::terminal::Clear;
 use ignore::WalkBuilder;
+use std::io::stdout;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::{fs, thread};
@@ -164,31 +167,30 @@ impl Workspace {
             }
         }
     }
-
-    pub fn chmod(&mut self, mode: AppMode) {
-        self.mode = mode;
-    }
-
     // Méthodes de déplacement qui mettent à jour l'aperçu automatiquement
     pub fn move_down(&mut self, visible_rows: usize) {
         if self.miller.move_down(visible_rows).is_some() {
+            queue!(stdout(), Clear(crossterm::terminal::ClearType::All)).unwrap();
             self.update_preview();
         }
     }
 
     pub fn move_up(&mut self) {
         if self.miller.move_up().is_some() {
+            queue!(stdout(), Clear(crossterm::terminal::ClearType::All)).unwrap();
             self.update_preview();
         }
     }
 
     pub fn enter_dir(&mut self) {
         self.miller.enter_dir();
+        queue!(stdout(), Clear(crossterm::terminal::ClearType::All)).unwrap();
         self.update_preview();
     }
 
     pub fn go_parent(&mut self) {
         self.miller.go_parent();
+        queue!(stdout(), Clear(crossterm::terminal::ClearType::All)).unwrap();
         self.update_preview();
     }
 }

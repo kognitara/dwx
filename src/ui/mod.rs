@@ -5,7 +5,7 @@ use crossterm::{
     style::{
         Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor, Stylize,
     },
-    terminal::{Clear, ClearType, size},
+    terminal::size,
 };
 use devicons::FileIcon;
 use std::io::{Write, stdout};
@@ -13,7 +13,6 @@ use std::io::{Write, stdout};
 pub fn draw_ui(workspace: &mut Workspace) {
     let mut stdout = stdout();
     let (cols, rows) = size().unwrap_or((100, 24));
-
     // 1. Calcul strict des largeurs de colonnes (10% / % / 30% / 50%)
     let col1_w = (cols as f32 * 0.20).round() as u16; // SYSINFO (élargi pour pousser vers la droite)
     let col2_w = (cols as f32 * 0.30).round() as u16; // PARENT
@@ -21,8 +20,6 @@ pub fn draw_ui(workspace: &mut Workspace) {
     let col1_x = 0;
     let col2_x = col1_w;
     let col3_x = col1_w + col2_w;
-    // On efface l'écran en un seul bloc pour éviter le scintillement (flickering)
-    queue!(stdout, Clear(ClearType::All)).unwrap();
 
     // ---------------------------------------------------------
     // 2. DESSIN DES EN-TÊTES (Avec contraste de focus)
@@ -172,7 +169,6 @@ pub fn draw_ui(workspace: &mut Workspace) {
                     SetBackgroundColor(Color::Black),
                     SetForegroundColor(Color::Red),
                     Print(format!("> {} {}", icon.icon, display_name)),
-                    Clear(ClearType::UntilNewLine),
                     ResetColor,
                 )
                 .unwrap();
@@ -189,9 +185,9 @@ pub fn draw_ui(workspace: &mut Workspace) {
                 queue!(
                     stdout,
                     SetAttribute(crossterm::style::Attribute::Bold),
+                    SetBackgroundColor(Color::Black),
                     SetForegroundColor(color),
                     Print(format!("  {} {}", icon.icon, display_name)),
-                    Clear(ClearType::UntilNewLine),
                     ResetColor,
                 )
                 .unwrap();
@@ -203,7 +199,6 @@ pub fn draw_ui(workspace: &mut Workspace) {
     // On nettoie les lignes restantes en bas si le filtre a réduit la liste
     while y < rows {
         queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
-        queue!(stdout, Clear(ClearType::UntilNewLine)).unwrap();
         y += 1;
     }
 
@@ -211,6 +206,7 @@ pub fn draw_ui(workspace: &mut Workspace) {
     // 5. COLONNE 5 : INSPECT / PREVIEW (`workspace.preview`)
     // ---------------------------------------------------------
     y = 2;
+    let preview_max_width = (cols.saturating_sub(col3_x + 2)) as usize;
     // On calcule la place dispo pour le texte
     match &workspace.preview {
         Preview::Dir(entries) => {
@@ -219,7 +215,8 @@ pub fn draw_ui(workspace: &mut Workspace) {
                     break;
                 }
                 let icon = FileIcon::from(item.path.to_path_buf());
-                queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
+                // On prépare le texte complet (icône + nom)
+                let full_text = format!("{} {}", icon.icon, item.name.as_str());
 
                 // Coloration standard : Bleu pour les dossiers, neutre pour les fichiers
                 let color = if item.is_dir {
@@ -232,24 +229,34 @@ pub fn draw_ui(workspace: &mut Workspace) {
                     Color::White
                 };
 
+                queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
+                // On le tronque avec "…" s'il dépasse le cadre
+                let display_text = if full_text.chars().count() > preview_max_width {
+                    let mut trunc: String = full_text
+                        .chars()
+                        .take(preview_max_width.saturating_sub(1))
+                        .collect();
+                    trunc.push('…');
+                    trunc
+                } else {
+                    full_text
+                };
+
                 queue!(
                     stdout,
                     SetAttribute(crossterm::style::Attribute::Bold),
                     SetBackgroundColor(Color::Black),
                     SetForegroundColor(color),
-                    // CORRECTION 1 : Une seule impression avec l'icône et le nom
-                    Print(format!("{} {}", icon.icon, item.name.as_str())),
-                    Clear(ClearType::UntilNewLine), // On s'assure d'effacer le reste de la ligne
+                    // On utilise display_text au lieu de construire le format directement ici
+                    Print(display_text),
                     ResetColor,
                 )
                 .unwrap();
                 y += 1;
             }
-
-            // CORRECTION 2 : Le nettoyage des lignes fantômes pour les dossiers
+            // --- CORRECTION : Nettoyage des lignes fantômes ---
             while y < rows {
                 queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
-                queue!(stdout, Clear(ClearType::UntilNewLine)).unwrap();
                 y += 1;
             }
         }
@@ -260,20 +267,24 @@ pub fn draw_ui(workspace: &mut Workspace) {
                 }
                 queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
 
-                // On imprime la ligne directement ! Elle contient déjà les codes couleurs
-                // et elle a déjà la bonne taille.
-                queue!(
-                    stdout,
-                    Print(line),
-                    Clear(ClearType::UntilNewLine),
-                    ResetColor, // Sécurité à la fin
-                )
-                .unwrap();
+                // Troncature propre de la ligne de texte
+                let display_line = if line.chars().count() > preview_max_width {
+                    let mut trunc: String = line
+                        .chars()
+                        .take(preview_max_width.saturating_sub(1))
+                        .collect();
+                    trunc.push('…');
+                    trunc
+                } else {
+                    line.clone()
+                };
+                queue!(stdout, Print(display_line), ResetColor,).unwrap();
                 y += 1;
             }
+
+            // --- CORRECTION : Nettoyage des lignes fantômes ---
             while y < rows {
                 queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
-                queue!(stdout, Clear(ClearType::UntilNewLine)).unwrap();
                 y += 1;
             }
         }
@@ -292,7 +303,6 @@ pub fn draw_ui(workspace: &mut Workspace) {
         queue!(stdout, MoveTo(0, rows.saturating_sub(1))).unwrap();
         queue!(
             stdout,
-            Clear(ClearType::CurrentLine),
             SetForegroundColor(Color::Black),
             SetAttribute(crossterm::style::Attribute::Bold),
             crossterm::style::SetBackgroundColor(Color::Red),
