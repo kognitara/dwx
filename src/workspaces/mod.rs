@@ -95,7 +95,7 @@ impl Workspace {
         let mut ws = Self {
             miller: base_miller.clone(),
             mode: AppMode::Normal,
-            active_pane: 2, // Focus sur CURRENT
+            active_pane: 1, // Focus sur CURRENT
             preview: Preview::Empty,
             current_perms: String::from("rwxr-xr-x"),
             current_preview: Vec::new(), // Vecteur vide au démarrage

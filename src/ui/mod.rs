@@ -14,15 +14,13 @@ pub fn draw_ui(workspace: &mut Workspace) {
     let mut stdout = stdout();
     let (cols, rows) = size().unwrap_or((100, 24));
 
-    // 1. Calcul strict des largeurs de colonnes (20% / 20% / 25% / 35%)
-    let col1_w = (cols as f32 * 0.15).round() as u16; // SYSINFO (élargi pour pousser vers la droite)
-    let col2_w = (cols as f32 * 0.15).round() as u16; // PARENT
-    let col3_w = (cols as f32 * 0.20).round() as u16; // CURRENT
+    // 1. Calcul strict des largeurs de colonnes (10% / % / 30% / 50%)
+    let col1_w = (cols as f32 * 0.20).round() as u16; // SYSINFO (élargi pour pousser vers la droite)
+    let col2_w = (cols as f32 * 0.30).round() as u16; // PARENT
     // 2. On calcule les positions X AVANT d'appeler la preview
     let col1_x = 0;
     let col2_x = col1_w;
     let col3_x = col1_w + col2_w;
-    let col4_x = col1_w + col2_w + col3_w; // Position de départ de PREVIEW
     // On efface l'écran en un seul bloc pour éviter le scintillement (flickering)
     queue!(stdout, Clear(ClearType::All)).unwrap();
 
@@ -53,10 +51,9 @@ pub fn draw_ui(workspace: &mut Workspace) {
     };
 
     // Plus de colonne ROOT, on décale les index
-    draw_header(0, col1_x, "SYSINFO");
-    draw_header(1, col2_x, "PARENT");
-    draw_header(2, col3_x, "CURRENT");
-    draw_header(3, col4_x, "PREVIEW");
+    draw_header(0, col1_x, "PARENT");
+    draw_header(1, col2_x, "CURRENT");
+    draw_header(2, col3_x, "PREVIEW");
 
     let max_rows = rows.saturating_sub(3); // On garde de la place pour la ligne d'en-tête
     // ---------------------------------------------------------
@@ -74,7 +71,7 @@ pub fn draw_ui(workspace: &mut Workspace) {
             break;
         }
         let icon = FileIcon::from(item.path.to_path_buf());
-        queue!(stdout, cursor::MoveTo(col2_x + 2, y)).unwrap();
+        queue!(stdout, cursor::MoveTo(col1_x + 2, y)).unwrap();
         if item.is_dir && item.path.to_path_buf().eq(&current) {
             queue!(
                 stdout,
@@ -156,7 +153,7 @@ pub fn draw_ui(workspace: &mut Workspace) {
 
         // On récupère le vrai fichier grâce à l'index filtré
         if let Some(item) = workspace.miller.current_entries.get(actual_item_idx) {
-            queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
+            queue!(stdout, cursor::MoveTo(col2_x + 2, y)).unwrap();
             let icon = FileIcon::from(item.path.to_path_buf());
 
             // Le curseur de sélection correspond à notre position dans la liste filtrée
@@ -222,7 +219,7 @@ pub fn draw_ui(workspace: &mut Workspace) {
                     break;
                 }
                 let icon = FileIcon::from(item.path.to_path_buf());
-                queue!(stdout, cursor::MoveTo(col4_x + 2, y)).unwrap();
+                queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
 
                 // Coloration standard : Bleu pour les dossiers, neutre pour les fichiers
                 let color = if item.is_dir {
@@ -251,7 +248,7 @@ pub fn draw_ui(workspace: &mut Workspace) {
 
             // CORRECTION 2 : Le nettoyage des lignes fantômes pour les dossiers
             while y < rows {
-                queue!(stdout, cursor::MoveTo(col4_x + 2, y)).unwrap();
+                queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
                 queue!(stdout, Clear(ClearType::UntilNewLine)).unwrap();
                 y += 1;
             }
@@ -261,7 +258,7 @@ pub fn draw_ui(workspace: &mut Workspace) {
                 if y >= rows {
                     break;
                 }
-                queue!(stdout, cursor::MoveTo(col4_x + 2, y)).unwrap();
+                queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
 
                 // On imprime la ligne directement ! Elle contient déjà les codes couleurs
                 // et elle a déjà la bonne taille.
@@ -275,7 +272,7 @@ pub fn draw_ui(workspace: &mut Workspace) {
                 y += 1;
             }
             while y < rows {
-                queue!(stdout, cursor::MoveTo(col4_x + 2, y)).unwrap();
+                queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
                 queue!(stdout, Clear(ClearType::UntilNewLine)).unwrap();
                 y += 1;
             }

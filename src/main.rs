@@ -164,24 +164,7 @@ fn main() -> io::Result<()> {
 
                         // Valider la recherche
                         KeyCode::Enter => {
-                            if prefix == '/' {
-                                workspace.mode = AppMode::Normal;
-                            } else if prefix == '?' {
-                                workspace.search_id += 1;
-
-                                // 2. On vide VRAIMENT la liste juste avant de lancer la recherche
-                                workspace.miller.current_entries.clear();
-                                workspace.miller.filtered_indices.clear();
-                                // On envoie l'ordre de recherche au thread !
-                                let dir_to_search = workspace.miller.current_dir.clone();
-                                let _ = workspace.tx_inspector.send(
-                                    bus::InspectorCommand::DeepSearch {
-                                        query: input_buffer.to_string(),
-                                        dir: dir_to_search,
-                                        search_id: workspace.search_id,
-                                    },
-                                );
-                            }
+                            workspace.mode = AppMode::Normal;
                         }
 
                         // Effacer un caractère
@@ -191,7 +174,6 @@ fn main() -> io::Result<()> {
                                 workspace.miller.filter(input_buffer.as_str()); // À implémenter plus tard
                             }
                         }
-
                         // Taper du texte
                         KeyCode::Char(c) => {
                             input_buffer.push(c);
@@ -201,7 +183,20 @@ fn main() -> io::Result<()> {
                                     workspace.miller.filter(input_buffer.as_str());
                                 }
                                 "?" => {
+                                    workspace.search_id += 1;
+
+                                    // 2. On vide VRAIMENT la liste juste avant de lancer la recherche
                                     workspace.miller.current_entries.clear();
+                                    workspace.miller.filtered_indices.clear();
+                                    // On envoie l'ordre de recherche au thread !
+                                    let dir_to_search = workspace.miller.current_dir.clone();
+                                    let _ = workspace.tx_inspector.send(
+                                        bus::InspectorCommand::DeepSearch {
+                                            query: input_buffer.to_string(),
+                                            dir: dir_to_search,
+                                            search_id: workspace.search_id,
+                                        },
+                                    );
                                 }
                                 _ => {
                                     continue;
