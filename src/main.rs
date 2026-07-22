@@ -10,6 +10,7 @@ use std::io::{self, stdout};
 use std::time::Duration;
 
 pub mod bus;
+pub mod editor;
 pub mod tree; // Ton nouveau MillerState tout propre
 pub mod ui;
 pub mod workspaces; // Ton Workspace // Là où tu as ta fonction draw_ui
@@ -94,6 +95,26 @@ fn main() -> io::Result<()> {
                                 prefix: '+',
                                 input_buffer: String::new(),
                             };
+                        }
+                        KeyCode::Enter => {
+                            let file = workspace
+                                .miller
+                                .current_entries
+                                .get(workspace.miller.selected_index)
+                                .expect("no file");
+                            if !file.path.is_file() {
+                                continue;
+                            }
+                            queue!(stdout, Hide, LeaveAlternateScreen).expect("failed");
+                            editor::view_file_with_scroll(file.path.as_path()).expect("failed");
+                            queue!(
+                                stdout,
+                                Hide,
+                                EnterAlternateScreen,
+                                Clear(crossterm::terminal::ClearType::All)
+                            )
+                            .expect("failed");
+                            continue;
                         }
                         KeyCode::Char('h') => {
                             workspace.mode = AppMode::Omnibar {
