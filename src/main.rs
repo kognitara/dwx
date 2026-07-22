@@ -1,70 +1,222 @@
-mod actions;
-mod app;
-mod cmds;
-mod crypto;
-mod storage;
-mod tabs;
-mod tree;
-mod ui;
-mod ux;
-mod views;
-mod workspaces;
-
-use crate::{app::App, tree::MillerState};
-use clap::Parser;
 use crossterm::{
     cursor::{Hide, Show},
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use std::{env::current_dir, io::stdout, path::PathBuf, process::ExitCode};
+use std::io::{self, stdout};
+use std::time::Duration;
 
-#[derive(Parser, Debug)]
-#[command(name = "dwx", version, about = "Data Walk eXtended")]
-pub struct Cli {
-    /// Le ou les fichiers à ouvrir dans les workspaces
-    #[arg(required = false, num_args = 1..)]
-    pub files: Vec<PathBuf>,
-}
+pub mod bus;
+pub mod tree; // Ton nouveau MillerState tout propre
+pub mod ui;
+pub mod workspaces; // Ton Workspace // Là où tu as ta fonction draw_ui
+use workspaces::{AppMode, Workspace};
 
-fn main() -> ExitCode {
-    // 1. On parse les arguments
-    let cli = Cli::parse();
+fn main() -> io::Result<()> {
+    // 1. Initialisation du Terminal
+    enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(stdout, Hide, EnterAlternateScreen)?;
 
-    if cli.files.is_empty() {
-        execute!(stdout(), EnterAlternateScreen, Hide).expect("faiedl to enteralternate screen");
-        // On désactive l'écho des touches et on lit le clavier en temps réel (Raw Mode)
-        enable_raw_mode().expect("failed to enabled raw mode");
-        let mut state = MillerState::new(current_dir().expect("faield to get current dir"));
-        let app_result = MillerState::run(&mut state);
-        disable_raw_mode().expect("failed to disabled raw mode");
-        execute!(stdout(), Show, LeaveAlternateScreen).expect("failed to exit alternate screen");
-        if let Err(err) = app_result {
-            eprintln!("Erreur critique dans dwx : {}", err);
-            return ExitCode::FAILURE;
-        } else {
-            return ExitCode::SUCCESS;
-        }
-    }
-    let mut app = App::default();
-    app.add_workspaces();
+    // 2. Initialisation de l'État (Dossier courant par défaut)
+    let start_dir = std::env::current_dir().unwrap_or_else(|_| dirs::home_dir().expect("home"));
+    let mut workspace = Workspace::new(start_dir);
 
-    // 2. On traite le pipe S'IL Y EN A UN
-    app.add_stdin();
-    for path in &cli.files {
-        if path.is_file() {
-            app.add_file(path);
-        }
-    }
-    let hashes: Vec<String> = app.buffers.keys().cloned().collect();
-    if let Some(workspace) = app.workspaces.get_mut(0)
-        && let Some(view) = App::find_active_view_mut(&mut workspace.root)
-    {
-        for hash in &hashes {
-            if !view.tabs.contains(hash) {
-                view.tabs.push(hash.to_string());
+    // 3. La Boucle Mushin
+    loop {
+        // A. On dépile les messages des threads en arrière-plan
+        workspace.poll_bus();
+
+        // B. On dessine l'interface
+        ui::draw_ui(&mut workspace);
+
+        // C. On écoute le clavier (16ms)
+        if event::poll(Duration::from_millis(16))?
+            && let Event::Key(key) = event::read()?
+        {
+            // On ignore les touches relâchées, on ne gère que les pressions
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            if workspace.pending_g {
+                workspace.pending_g = false;
+                let target_dir = match key.code {
+                    KeyCode::Char('h') => dirs::home_dir(),
+                    KeyCode::Char('D') => dirs::download_dir(),
+                    KeyCode::Char('d') => dirs::document_dir(),
+                    KeyCode::Char('a') => dirs::audio_dir(),
+                    KeyCode::Char('b') => dirs::executable_dir(),
+                    KeyCode::Char('c') => dirs::config_dir(),
+                    KeyCode::Char('p') => dirs::picture_dir(),
+                    KeyCode::Char('v') => dirs::video_dir(),
+                    KeyCode::Char('f') => dirs::font_dir(),
+                    KeyCode::Char('t') => dirs::template_dir(),
+                    KeyCode::Char('r') => Some(std::path::PathBuf::from("/")),
+                    _ => None, // Si on tape une autre touche, on annule l'action
+                };
+
+                if let Some(new_dir) = target_dir {
+                    // Si le dossier existe, on s'y téléporte !
+                    if new_dir.exists() && new_dir.is_dir() {
+                        workspace.miller.set_dir(new_dir);
+                    }
+                }
+                continue;
+            }
+            match workspace.mode {
+                AppMode::Normal => {
+                    match key.code {
+                        KeyCode::Char('/') => {
+                            workspace.mode = AppMode::Omnibar {
+                                prefix: '/',
+                                input_buffer: String::new(),
+                            };
+                        }
+                        KeyCode::Char('f') => {
+                            workspace.mode = AppMode::Omnibar {
+                                prefix: '+',
+                                input_buffer: String::new(),
+                            };
+                        }
+                        KeyCode::Char('a') => {
+                            workspace.mode = AppMode::Omnibar {
+                                prefix: '+',
+                                input_buffer: String::new(),
+                            };
+                        }
+                        KeyCode::Char('s') => {
+                            workspace.mode = AppMode::Omnibar {
+                                prefix: '+',
+                                input_buffer: String::new(),
+                            };
+                        }
+                        KeyCode::Char('h') => {
+                            workspace.mode = AppMode::Omnibar {
+                                prefix: '#',
+                                input_buffer: String::new(),
+                            };
+                        }
+                        KeyCode::Char('?') => {
+                            workspace.mode = AppMode::Omnibar {
+                                prefix: '?',
+                                input_buffer: String::new(),
+                            };
+                        }
+                        KeyCode::Char('p') => {
+                            workspace.mode = AppMode::Omnibar {
+                                prefix: '+',
+                                input_buffer: String::new(),
+                            };
+                        }
+                        KeyCode::Char('q') => break,
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            workspace.move_down(20); // Ça bouge le curseur ET met à jour le preview d'un coup !
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            workspace.move_up();
+                        }
+                        KeyCode::Char('l') | KeyCode::Right | KeyCode::Char(' ') => {
+                            workspace.enter_dir();
+                        }
+                        KeyCode::Left | KeyCode::Backspace => {
+                            workspace.go_parent();
+                        }
+                        // --- MODES ET DRAPEAUX ---
+                        KeyCode::Char('n') => {
+                            workspace.pending_create = true;
+                        }
+                        KeyCode::Char('d') if workspace.pending_create => {
+                            workspace.pending_create = false;
+                            workspace.pending_create_dir = true;
+                            workspace.mode = AppMode::Omnibar {
+                                prefix: '+',
+                                input_buffer: String::new(),
+                            };
+                        }
+                        KeyCode::Char('g') => {
+                            workspace.pending_g = true;
+                            continue;
+                        }
+                        // Rafraîchissement manuel
+                        KeyCode::F(5) => workspace.miller.refresh(),
+                        _ => {
+                            // Si on tape une touche non reconnue, on annule les actions en cours
+                            workspace.pending_create = false;
+                            workspace.pending_g = false;
+                        }
+                    }
+                }
+                AppMode::Omnibar {
+                    prefix,
+                    ref mut input_buffer,
+                } => {
+                    match key.code {
+                        // Quitter la barre avec Échap
+                        KeyCode::Esc => {
+                            workspace.mode = AppMode::Normal;
+                            if prefix == '/' {
+                                workspace.miller.filter("");
+                                workspace.update_preview();
+                            }
+                        }
+
+                        // Valider la recherche
+                        KeyCode::Enter => {
+                            if prefix == '/' {
+                                workspace.mode = AppMode::Normal;
+                            } else if prefix == '?' {
+                                workspace.search_id += 1;
+
+                                // 2. On vide VRAIMENT la liste juste avant de lancer la recherche
+                                workspace.miller.current_entries.clear();
+                                workspace.miller.filtered_indices.clear();
+                                // On envoie l'ordre de recherche au thread !
+                                let dir_to_search = workspace.miller.current_dir.clone();
+                                let _ = workspace.tx_inspector.send(
+                                    bus::InspectorCommand::DeepSearch {
+                                        query: input_buffer.to_string(),
+                                        dir: dir_to_search,
+                                        search_id: workspace.search_id,
+                                    },
+                                );
+                            }
+                        }
+
+                        // Effacer un caractère
+                        KeyCode::Backspace => {
+                            input_buffer.pop();
+                            if prefix == '/' {
+                                workspace.miller.filter(input_buffer.as_str()); // À implémenter plus tard
+                            }
+                        }
+
+                        // Taper du texte
+                        KeyCode::Char(c) => {
+                            input_buffer.push(c);
+                            // Si on est en mode recherche ('/'), on peut filtrer en temps réel ici !
+                            match prefix.to_string().as_str() {
+                                "/" => {
+                                    workspace.miller.filter(input_buffer.as_str());
+                                }
+                                "?" => {
+                                    workspace.miller.current_entries.clear();
+                                }
+                                _ => {
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
     }
-    app.run()
+    execute!(stdout, Show)?;
+    execute!(stdout, LeaveAlternateScreen)?;
+    disable_raw_mode()?;
+
+    Ok(())
 }

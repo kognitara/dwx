@@ -427,6 +427,7 @@ dependencies = [
  "devicons",
  "dirs",
  "flate2",
+ "human-units",
  "ignore",
  "is_executable",
  "regex",
@@ -592,6 +593,15 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "human-units"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de83553769446dd944c447e8379c92872bd8d507a84053eeb0982529e809d59e"
+dependencies = [
+ "pastey",
+]
 
 [[package]]
 name = "ignore"
@@ -915,6 +925,12 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
+
+[[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "percent-encoding"

@@ -1,299 +1,310 @@
-use crate::tree::{FileItem, MillerState, Preview};
+use crate::workspaces::{AppMode, Preview, Workspace};
 use crossterm::{
-    QueueableCommand,
-    cursor::{Hide, MoveTo},
-    style::{Attribute::Bold, Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
+    cursor::{self, MoveTo},
+    queue,
+    style::{
+        Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor, Stylize,
+    },
     terminal::{Clear, ClearType, size},
 };
 use devicons::FileIcon;
 use std::io::{Write, stdout};
 
-fn echo(
-    output: &mut std::io::Stdout,
-    item: &FileItem,
-    display_name: &String,
-    hover: bool,
-    hover_bg_color: Color,
-    hover_fg_color: Color,
-) -> std::io::Result<()> {
-    let fg_color = if item.is_symlink {
-        Color::Cyan
-    } else if item.is_dir {
-        Color::Blue
-    } else if item.is_executable {
-        Color::Green
-    } else {
-        Color::Reset
-    };
-    let icon = FileIcon::from(item.path.canonicalize().expect("failed"));
-
-    // 1. On applique les couleurs pour dessiner l'icône
-    if hover {
-        output.queue(SetBackgroundColor(hover_bg_color))?;
-        output.queue(SetForegroundColor(hover_fg_color))?;
-    } else {
-        output.queue(SetBackgroundColor(Color::Reset))?;
-        output.queue(SetForegroundColor(fg_color))?;
-    }
-
-    output.queue(Print(Bold))?;
-    output.queue(Print(format!(" {} ", icon.icon)))?;
-
-    // --- CORRECTION : RÉ-APPLICATION DES COULEURS ---
-    // On force la remise des couleurs car devicons vient de tout réinitialiser
-    if hover {
-        output.queue(SetBackgroundColor(hover_bg_color))?;
-        output.queue(SetForegroundColor(hover_fg_color))?;
-    } else {
-        output.queue(SetBackgroundColor(Color::Reset))?;
-        output.queue(SetForegroundColor(fg_color))?;
-    }
-    // ------------------------------------------------
-
-    // 3. Afficher le texte et réinitialiser
-    output.queue(Print(display_name))?;
-    output.queue(ResetColor)?;
-    Ok(())
-}
-
-pub fn draw(state: &mut MillerState) -> std::io::Result<()> {
+pub fn draw_ui(workspace: &mut Workspace) {
     let mut stdout = stdout();
-    // On efface l'écran à chaque frame et on cache le curseur
-    stdout.queue(Clear(ClearType::All))?;
-    stdout.queue(Hide)?;
-    // 1. On récupère la taille dynamique du terminal
-    let (cols, rows) = size()?;
+    let (cols, rows) = size().unwrap_or((100, 24));
 
-    // 2. Calcul des largeurs des 3 colonnes
-    let col1_w = (cols as f32 * 0.20) as u16;
-    let col2_w = (cols as f32 * 0.30) as u16;
-    let col3_w = cols.saturating_sub(col1_w).saturating_sub(col2_w);
+    // 1. Calcul strict des largeurs de colonnes (20% / 20% / 25% / 35%)
+    let col1_w = (cols as f32 * 0.15).round() as u16; // SYSINFO (élargi pour pousser vers la droite)
+    let col2_w = (cols as f32 * 0.15).round() as u16; // PARENT
+    let col3_w = (cols as f32 * 0.20).round() as u16; // CURRENT
+    // 2. On calcule les positions X AVANT d'appeler la preview
+    let col1_x = 0;
+    let col2_x = col1_w;
+    let col3_x = col1_w + col2_w;
+    let col4_x = col1_w + col2_w + col3_w; // Position de départ de PREVIEW
+    // On efface l'écran en un seul bloc pour éviter le scintillement (flickering)
+    queue!(stdout, Clear(ClearType::All)).unwrap();
 
-    // --- COLONNE 1 : LE PARENT ---
-    // On trouve le chemin du parent direct
-    let parent_path = state.current_dir.parent().unwrap_or(&state.current_dir);
+    // ---------------------------------------------------------
+    // 2. DESSIN DES EN-TÊTES (Avec contraste de focus)
+    // ---------------------------------------------------------
+    let mut draw_header = |pane_idx: usize, x: u16, title: &str| {
+        queue!(stdout, cursor::MoveTo(x + 2, 0)).unwrap();
+        if workspace.active_pane == pane_idx {
+            queue!(
+                stdout,
+                SetForegroundColor(Color::Red),
+                SetAttribute(crossterm::style::Attribute::Bold),
+                Print(title),
+                ResetColor,
+            )
+            .unwrap();
+        } else {
+            queue!(
+                stdout,
+                SetAttribute(crossterm::style::Attribute::Bold),
+                SetForegroundColor(Color::White),
+                Print(title),
+                ResetColor,
+            )
+            .unwrap();
+        }
+    };
 
-    // On va chercher son offset dans l'historique (0 par défaut si jamais visité)
-    let parent_scroll_offset = state
-        .history
-        .get(parent_path)
-        .map(|s| s.scroll_offset)
-        .unwrap_or(0);
+    // Plus de colonne ROOT, on décale les index
+    draw_header(0, col1_x, "SYSINFO");
+    draw_header(1, col2_x, "PARENT");
+    draw_header(2, col3_x, "CURRENT");
+    draw_header(3, col4_x, "PREVIEW");
 
-    // On applique le skip avec l'offset historique !
-    for (i, item) in state
+    let max_rows = rows.saturating_sub(3); // On garde de la place pour la ligne d'en-tête
+    // ---------------------------------------------------------
+    // 1. COLONNE 1  : SYS INFOS
+    // ---------------------------------------------------------
+    let mut y = 2;
+    let current = workspace.miller.current_dir.to_path_buf();
+    for item in workspace
+        .miller
         .parent_entries
         .iter()
-        .skip(parent_scroll_offset)
-        .take(rows as usize)
-        .enumerate()
+        .take(max_rows as usize)
     {
-        stdout.queue(MoveTo(0, i as u16))?;
-        let display_name = format_item(item, col1_w);
-
-        let is_current_parent = item.path == state.current_dir;
-        echo(
-            &mut stdout,
-            item,
-            &display_name,
-            is_current_parent,
-            Color::Blue,
-            Color::Black,
-        )?;
+        if y >= rows {
+            break;
+        }
+        let icon = FileIcon::from(item.path.to_path_buf());
+        queue!(stdout, cursor::MoveTo(col2_x + 2, y)).unwrap();
+        if item.is_dir && item.path.to_path_buf().eq(&current) {
+            queue!(
+                stdout,
+                SetAttribute(crossterm::style::Attribute::Bold),
+                SetBackgroundColor(Color::Black),
+                SetForegroundColor(Color::Blue),
+                Print(format!(
+                    "{} {} {}",
+                    icon.icon,
+                    item.name.as_str(),
+                    "*".red().italic().bold()
+                )),
+                ResetColor,
+            )
+            .unwrap();
+        } else if item.is_dir {
+            queue!(
+                stdout,
+                SetAttribute(crossterm::style::Attribute::Bold),
+                SetBackgroundColor(Color::Black),
+                SetForegroundColor(Color::Blue),
+                Print(format!("{} {}", icon.icon, item.name.as_str())),
+                ResetColor,
+            )
+            .unwrap();
+        } else if item.is_executable {
+            queue!(
+                stdout,
+                SetAttribute(crossterm::style::Attribute::Bold),
+                SetBackgroundColor(Color::Black),
+                SetForegroundColor(Color::Green),
+                Print(format!("{} {}", icon.icon, item.name.as_str())),
+                ResetColor,
+            )
+            .unwrap();
+        } else if item.is_symlink {
+            queue!(
+                stdout,
+                SetAttribute(crossterm::style::Attribute::Bold),
+                SetBackgroundColor(Color::Black),
+                SetForegroundColor(Color::Cyan),
+                Print(format!("{} {}", icon.icon, item.name.as_str())),
+                ResetColor,
+            )
+            .unwrap();
+        } else {
+            queue!(
+                stdout,
+                SetAttribute(crossterm::style::Attribute::Bold),
+                SetBackgroundColor(Color::Black),
+                SetForegroundColor(Color::White),
+                Print(format!("{} {}", icon.icon, item.name.as_str())),
+                ResetColor,
+            )
+            .unwrap();
+        };
+        y += 1;
     }
 
-    // 3. On applique le skip() comme pour la Colonne 2
-    for (i, item) in state
-        .parent_entries
-        .iter()
-        .skip(parent_scroll_offset)
-        .take(rows as usize)
-        .enumerate()
-    {
-        stdout.queue(MoveTo(0, i as u16))?;
-        let display_name = format_item(item, col1_w);
+    // ---------------------------------------------------------
+    // 4. COLONNE 4 : CURRENT (Dossier courant avec curseur actif)
+    // ---------------------------------------------------------
+    y = 2;
+    let start_idx = workspace.miller.scroll_offset;
 
-        let is_current_parent = item.path == state.current_dir;
-        echo(
-            &mut stdout,
-            item,
-            &display_name,
-            is_current_parent,
-            Color::Blue,
-            Color::Black,
-        )?;
-    }
-
-    // --- COLONNE 2 : LE DOSSIER COURANT (Focus actif filtré) ---
-    // Au lieu de lire current_entries, on lit notre calque filtered_indices !
-    // On garde une petite marge en bas (rows - 1) pour ne pas écraser la barre de recherche
-    let visible_rows = rows.saturating_sub(1) as usize;
-
-    for (i, &actual_index) in state
+    // On itère sur les index FILTRÉS, pas sur tous les fichiers
+    let visible_indices = workspace
+        .miller
         .filtered_indices
         .iter()
-        .skip(state.scroll_offset)
-        .take(visible_rows)
         .enumerate()
-    {
-        stdout.queue(MoveTo(col1_w, i as u16))?;
+        .skip(start_idx)
+        .take(max_rows as usize);
 
-        // On récupère le VRAI fichier en utilisant l'index du calque
-        if let Some(item) = state.current_entries.get(actual_index) {
-            let display_name = format_item(item, col2_w);
+    for (loop_idx, &actual_item_idx) in visible_indices {
+        if y >= rows {
+            break;
+        }
 
-            // Le fichier est sélectionné si sa position DANS LE CALQUE correspond au selected_index
-            let is_selected = (i + state.scroll_offset) == state.selected_index;
+        // On récupère le vrai fichier grâce à l'index filtré
+        if let Some(item) = workspace.miller.current_entries.get(actual_item_idx) {
+            queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
+            let icon = FileIcon::from(item.path.to_path_buf());
 
-            // Ton ancienne logique de couleur reste la même
-            if item.is_dir {
-                echo(
-                    &mut stdout,
-                    item,
-                    &display_name,
-                    is_selected,
-                    Color::Blue,
-                    Color::Black,
-                )?;
-            } else if item.is_executable {
-                echo(
-                    &mut stdout,
-                    item,
-                    &display_name,
-                    is_selected,
-                    Color::Green,
-                    Color::Black,
-                )?;
-            } else if item.is_file {
-                echo(
-                    &mut stdout,
-                    item,
-                    &display_name,
-                    is_selected,
-                    Color::White,
-                    Color::Black,
-                )?;
+            // Le curseur de sélection correspond à notre position dans la liste filtrée
+            let is_selected = loop_idx == workspace.miller.selected_index;
+
+            let display_name = if item.is_dir {
+                format!("{}/", item.name)
             } else {
-                echo(
-                    &mut stdout,
-                    item,
-                    &display_name,
-                    is_selected,
-                    Color::Black,
-                    Color::White,
-                )?;
+                item.name.clone()
+            };
+
+            if is_selected {
+                queue!(
+                    stdout,
+                    SetAttribute(crossterm::style::Attribute::Bold),
+                    SetBackgroundColor(Color::Black),
+                    SetForegroundColor(Color::Red),
+                    Print(format!("> {} {}", icon.icon, display_name)),
+                    Clear(ClearType::UntilNewLine),
+                    ResetColor,
+                )
+                .unwrap();
+            } else {
+                let color = if item.is_dir {
+                    Color::Blue
+                } else if item.is_executable {
+                    Color::Green
+                } else if item.is_symlink {
+                    Color::Cyan
+                } else {
+                    Color::White
+                };
+                queue!(
+                    stdout,
+                    SetAttribute(crossterm::style::Attribute::Bold),
+                    SetForegroundColor(color),
+                    Print(format!("  {} {}", icon.icon, display_name)),
+                    Clear(ClearType::UntilNewLine),
+                    ResetColor,
+                )
+                .unwrap();
             }
+            y += 1;
         }
     }
-    // --- COLONNE 3 : L'APERÇU ---
-    // (Ancienne boucle preview_entries supprimée ici pour éviter les conflits d'affichage)
 
-    match &state.preview {
+    // On nettoie les lignes restantes en bas si le filtre a réduit la liste
+    while y < rows {
+        queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
+        queue!(stdout, Clear(ClearType::UntilNewLine)).unwrap();
+        y += 1;
+    }
+
+    // ---------------------------------------------------------
+    // 5. COLONNE 5 : INSPECT / PREVIEW (`workspace.preview`)
+    // ---------------------------------------------------------
+    y = 2;
+    // On calcule la place dispo pour le texte
+    match &workspace.preview {
         Preview::Dir(entries) => {
-            // Affichage du contenu d'un dossier en aperçu
-            for (i, item) in entries.iter().take(rows as usize).enumerate() {
-                stdout.queue(MoveTo(col1_w + col2_w, i as u16))?;
-                let display_name = format_item(item, col3_w);
-
-                if item.is_dir {
-                    echo(
-                        &mut stdout,
-                        item,
-                        &display_name,
-                        i == 0,
-                        Color::Blue,
-                        Color::Black,
-                    )?;
-                } else if item.is_file {
-                    echo(
-                        &mut stdout,
-                        item,
-                        &display_name,
-                        i == 0,
-                        Color::White,
-                        Color::Black,
-                    )?;
-                } else if item.is_executable {
-                    echo(
-                        &mut stdout,
-                        item,
-                        &display_name,
-                        i == 0,
-                        Color::Green,
-                        Color::Black,
-                    )?;
-                } else if item.is_symlink {
-                    echo(
-                        &mut stdout,
-                        item,
-                        &display_name,
-                        i == 0,
-                        Color::Cyan,
-                        Color::Black,
-                    )?;
+            for item in entries.iter().take(max_rows as usize) {
+                if y >= rows {
+                    break;
                 }
-                // CONDITION POUR SURBRILLER LE PREMIER : i == 0
+                let icon = FileIcon::from(item.path.to_path_buf());
+                queue!(stdout, cursor::MoveTo(col4_x + 2, y)).unwrap();
+
+                // Coloration standard : Bleu pour les dossiers, neutre pour les fichiers
+                let color = if item.is_dir {
+                    Color::Blue
+                } else if item.is_executable {
+                    Color::Green
+                } else if item.is_symlink {
+                    Color::Cyan
+                } else {
+                    Color::White
+                };
+
+                queue!(
+                    stdout,
+                    SetAttribute(crossterm::style::Attribute::Bold),
+                    SetBackgroundColor(Color::Black),
+                    SetForegroundColor(color),
+                    // CORRECTION 1 : Une seule impression avec l'icône et le nom
+                    Print(format!("{} {}", icon.icon, item.name.as_str())),
+                    Clear(ClearType::UntilNewLine), // On s'assure d'effacer le reste de la ligne
+                    ResetColor,
+                )
+                .unwrap();
+                y += 1;
+            }
+
+            // CORRECTION 2 : Le nettoyage des lignes fantômes pour les dossiers
+            while y < rows {
+                queue!(stdout, cursor::MoveTo(col4_x + 2, y)).unwrap();
+                queue!(stdout, Clear(ClearType::UntilNewLine)).unwrap();
+                y += 1;
             }
         }
         Preview::File(lines) => {
-            // Affichage du code source coloré par syntect
-            let max_preview_width = col3_w.saturating_sub(1) as usize;
+            for line in lines.iter().take(max_rows as usize) {
+                if y >= rows {
+                    break;
+                }
+                queue!(stdout, cursor::MoveTo(col4_x + 2, y)).unwrap();
 
-            for (i, line) in lines.iter().take(rows as usize).enumerate() {
-                stdout.queue(MoveTo(col1_w + col2_w, i as u16))?;
-
-                // On coupe violemment la ligne si elle dépasse la largeur de la colonne 3
-                let truncated_line: String = line.chars().take(max_preview_width).collect();
-                stdout.queue(Print(truncated_line))?;
+                // On imprime la ligne directement ! Elle contient déjà les codes couleurs
+                // et elle a déjà la bonne taille.
+                queue!(
+                    stdout,
+                    Print(line),
+                    Clear(ClearType::UntilNewLine),
+                    ResetColor, // Sécurité à la fin
+                )
+                .unwrap();
+                y += 1;
+            }
+            while y < rows {
+                queue!(stdout, cursor::MoveTo(col4_x + 2, y)).unwrap();
+                queue!(stdout, Clear(ClearType::UntilNewLine)).unwrap();
+                y += 1;
             }
         }
         Preview::Empty => {}
     }
-    // --- L'OMNIBAR (Barre de recherche) ---
-    // Si on est en mode saisie, on dessine la barre tout en bas de l'écran
-    if let crate::tree::AppMode::Omnibar {
+
+    // ---------------------------------------------------------
+    // 6. OMNIBAR (Barre de recherche / création)
+    // ---------------------------------------------------------
+    if let AppMode::Omnibar {
         prefix,
         input_buffer,
-        receiver: _,
-        kill_switch: _,
-    } = &state.mode
+    } = &workspace.mode
     {
-        // On se place sur la toute dernière ligne du terminal
-        stdout.queue(MoveTo(0, rows.saturating_sub(1)))?;
-
-        // Un petit style visuel distinct (tu peux l'ajuster pour ton thème sombre)
-        stdout.queue(SetBackgroundColor(Color::White))?;
-        stdout.queue(SetForegroundColor(Color::Black))?;
-        stdout.queue(Print(Bold))?;
-
-        // On remplit la ligne d'espaces pour que le fond gris aille jusqu'au bout
-        let prompt = format!("{} {} ", prefix, input_buffer);
-        let padding = " ".repeat(cols.saturating_sub(prompt.chars().count() as u16) as usize);
-
-        stdout.queue(Print(format!("{}{}", prompt, padding)))?;
-        stdout.queue(ResetColor)?;
+        // On se place sur la toute dernière ligne en bas de l'écran
+        queue!(stdout, MoveTo(0, rows.saturating_sub(1))).unwrap();
+        queue!(
+            stdout,
+            Clear(ClearType::CurrentLine),
+            SetForegroundColor(Color::Black),
+            SetAttribute(crossterm::style::Attribute::Bold),
+            crossterm::style::SetBackgroundColor(Color::Red),
+            Print(format!(" {} {} ", prefix, input_buffer)),
+            Print(" ".repeat((cols as usize).saturating_sub(input_buffer.len() + 4))),
+            Print(ResetColor)
+        )
+        .unwrap();
     }
-    // On s'assure de tout réinitialiser et on pousse l'affichage à l'écran
-    stdout.queue(ResetColor)?;
-    stdout.flush()?;
-
-    Ok(())
-}
-
-fn format_item(item: &FileItem, max_width: u16) -> String {
-    // CORRECTION : On retire 1 pour la gouttière ET 3 pour l'icône (" {} ")
-    let display_width = max_width.saturating_sub(4) as usize;
-    let name = item.name.clone();
-
-    let char_count = name.chars().count();
-
-    if char_count > display_width {
-        let mut truncated: String = name.chars().take(display_width.saturating_sub(1)).collect();
-        truncated.push('…');
-        truncated
-    } else {
-        let spaces_needed = display_width - char_count;
-        let padding = " ".repeat(spaces_needed);
-        format!("{}{}", name, padding)
-    }
+    // Pousse tout le rendu vers le terminal en un seul coup (Mushin pur)
+    stdout.flush().unwrap();
 }
