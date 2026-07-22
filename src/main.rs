@@ -63,6 +63,7 @@ fn main() -> io::Result<()> {
                     // Si le dossier existe, on s'y téléporte !
                     if new_dir.exists() && new_dir.is_dir() {
                         workspace.miller.set_dir(new_dir);
+                        queue!(stdout, Clear(crossterm::terminal::ClearType::All)).unwrap();
                     }
                 }
                 continue;
