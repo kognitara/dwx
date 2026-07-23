@@ -93,14 +93,10 @@ fn main() -> io::Result<()> {
                 AppMode::Normal => {
                     match key.code {
                         KeyCode::F(2) => {
-                            if current_file_item.path.is_file() {
-                                workspace.mode = AppMode::Omnibar {
-                                    prefix: '*',
-                                    input_buffer: current_file_item.name,
-                                };
-                            } else {
-                                continue;
-                            }
+                            workspace.mode = AppMode::Omnibar {
+                                prefix: '*',
+                                input_buffer: current_file_item.name,
+                            };
                         }
                         KeyCode::Char('/') => {
                             workspace.mode = AppMode::Omnibar {
@@ -218,10 +214,11 @@ fn main() -> io::Result<()> {
                         // Valider la recherche
                         KeyCode::Enter => {
                             queue!(stdout, Clear(crossterm::terminal::ClearType::All)).unwrap();
-                            if prefix == '*' && current_file_item.path.is_file() {
-                                workspace
-                                    .miller
-                                    .rename(current_file_item.name, input_buffer.to_string());
+                            if prefix == '*' {
+                                workspace.miller.rename(
+                                    current_file_item.path.clone(),
+                                    input_buffer.to_string(),
+                                );
                                 workspace.miller.refresh();
                             }
                             workspace.mode = AppMode::Normal;
