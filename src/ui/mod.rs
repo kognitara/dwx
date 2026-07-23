@@ -5,18 +5,19 @@ use crossterm::{
     style::{
         Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor, Stylize,
     },
-    terminal::size,
+    terminal::{Clear, ClearType, size},
 };
-use devicons::FileIcon;
 use std::io::{Write, stdout};
+use std::sync::OnceLock;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Style as SyntectStyle, ThemeSet};
+use syntect::parsing::SyntaxSet;
 
 pub fn draw_ui(workspace: &mut Workspace) {
     let mut stdout = stdout();
     let (cols, rows) = size().unwrap_or((100, 24));
-    // 1. Calcul strict des largeurs de colonnes (10% / % / 30% / 50%)
-    let col1_w = (cols as f32 * 0.20).round() as u16; // SYSINFO (élargi pour pousser vers la droite)
-    let col2_w = (cols as f32 * 0.30).round() as u16; // PARENT
-    // 2. On calcule les positions X AVANT d'appeler la preview
+    let col1_w = (cols as f32 * 0.20).round() as u16;
+    let col2_w = (cols as f32 * 0.30).round() as u16;
     let col1_x = 0;
     let col2_x = col1_w;
     let col3_x = col1_w + col2_w;
@@ -47,12 +48,12 @@ pub fn draw_ui(workspace: &mut Workspace) {
         }
     };
 
-    // Plus de colonne ROOT, on décale les index
     draw_header(0, col1_x, "PARENT");
     draw_header(1, col2_x, "CURRENT");
     draw_header(2, col3_x, "PREVIEW");
 
-    let max_rows = rows.saturating_sub(3); // On garde de la place pour la ligne d'en-tête
+    let max_rows = rows.saturating_sub(3);
+
     // ---------------------------------------------------------
     // 1. COLONNE 1  : SYS INFOS
     // ---------------------------------------------------------
@@ -67,7 +68,7 @@ pub fn draw_ui(workspace: &mut Workspace) {
         if y >= rows {
             break;
         }
-        let icon = FileIcon::from(item.path.to_path_buf());
+        let icon = devicons::FileIcon::from(item.path.to_path_buf());
         queue!(stdout, cursor::MoveTo(col1_x + 2, y)).unwrap();
         if item.is_dir && item.path.to_path_buf().eq(&current) {
             queue!(
@@ -133,8 +134,6 @@ pub fn draw_ui(workspace: &mut Workspace) {
     // ---------------------------------------------------------
     y = 2;
     let start_idx = workspace.miller.scroll_offset;
-
-    // On itère sur les index FILTRÉS, pas sur tous les fichiers
     let visible_indices = workspace
         .miller
         .filtered_indices
@@ -148,12 +147,10 @@ pub fn draw_ui(workspace: &mut Workspace) {
             break;
         }
 
-        // On récupère le vrai fichier grâce à l'index filtré
         if let Some(item) = workspace.miller.current_entries.get(actual_item_idx) {
             queue!(stdout, cursor::MoveTo(col2_x + 2, y)).unwrap();
-            let icon = FileIcon::from(item.path.to_path_buf());
+            let icon = devicons::FileIcon::from(item.path.to_path_buf());
 
-            // Le curseur de sélection correspond à notre position dans la liste filtrée
             let is_selected = loop_idx == workspace.miller.selected_index;
 
             let display_name = if item.is_dir {
@@ -196,9 +193,13 @@ pub fn draw_ui(workspace: &mut Workspace) {
         }
     }
 
-    // On nettoie les lignes restantes en bas si le filtre a réduit la liste
     while y < rows {
-        queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
+        queue!(
+            stdout,
+            cursor::MoveTo(col3_x + 2, y),
+            Clear(ClearType::UntilNewLine)
+        )
+        .unwrap();
         y += 1;
     }
 
@@ -207,18 +208,15 @@ pub fn draw_ui(workspace: &mut Workspace) {
     // ---------------------------------------------------------
     y = 2;
     let preview_max_width = (cols.saturating_sub(col3_x + 2)) as usize;
-    // On calcule la place dispo pour le texte
     match &workspace.preview {
         Preview::Dir(entries) => {
             for item in entries.iter().take(max_rows as usize) {
                 if y >= rows {
                     break;
                 }
-                let icon = FileIcon::from(item.path.to_path_buf());
-                // On prépare le texte complet (icône + nom)
+                let icon = devicons::FileIcon::from(item.path.to_path_buf());
                 let full_text = format!("{} {}", icon.icon, item.name.as_str());
 
-                // Coloration standard : Bleu pour les dossiers, neutre pour les fichiers
                 let color = if item.is_dir {
                     Color::Blue
                 } else if item.is_executable {
@@ -230,7 +228,6 @@ pub fn draw_ui(workspace: &mut Workspace) {
                 };
 
                 queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
-                // On le tronque avec "…" s'il dépasse le cadre
                 let display_text = if full_text.chars().count() > preview_max_width {
                     let mut trunc: String = full_text
                         .chars()
@@ -247,44 +244,97 @@ pub fn draw_ui(workspace: &mut Workspace) {
                     SetAttribute(crossterm::style::Attribute::Bold),
                     SetBackgroundColor(Color::Black),
                     SetForegroundColor(color),
-                    // On utilise display_text au lieu de construire le format directement ici
                     Print(display_text),
+                    Clear(ClearType::UntilNewLine),
                     ResetColor,
                 )
                 .unwrap();
                 y += 1;
             }
-            // --- CORRECTION : Nettoyage des lignes fantômes ---
             while y < rows {
-                queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
+                queue!(
+                    stdout,
+                    cursor::MoveTo(col3_x + 2, y),
+                    Clear(ClearType::UntilNewLine)
+                )
+                .unwrap();
                 y += 1;
             }
         }
         Preview::File(lines) => {
+            // --- NOUVEAU : Coloration Syntaxique Syntect ---
+            static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+            static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
+
+            let ps = SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines);
+            let ts = THEME_SET.get_or_init(ThemeSet::load_defaults);
+            let theme = &ts.themes["base16-ocean.dark"];
+
+            // Récupérer l'extension du fichier actuellement sélectionné pour appliquer la bonne syntaxe
+            let mut syntax = ps.find_syntax_plain_text();
+
+            if let Some(&actual_item_idx) = workspace
+                .miller
+                .filtered_indices
+                .get(workspace.miller.selected_index)
+            {
+                if let Some(item) = workspace.miller.current_entries.get(actual_item_idx) {
+                    if let Some(ext) = item.path.extension().and_then(|s| s.to_str()) {
+                        if let Some(found_syntax) = ps.find_syntax_by_extension(ext) {
+                            syntax = found_syntax;
+                        }
+                    }
+                }
+            }
+
+            let mut h = HighlightLines::new(syntax, theme);
+
             for line in lines.iter().take(max_rows as usize) {
                 if y >= rows {
                     break;
                 }
                 queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
 
-                // Troncature propre de la ligne de texte
-                let display_line = if line.chars().count() > preview_max_width {
-                    let mut trunc: String = line
-                        .chars()
-                        .take(preview_max_width.saturating_sub(1))
-                        .collect();
-                    trunc.push('…');
-                    trunc
-                } else {
-                    line.clone()
-                };
-                queue!(stdout, Print(display_line), ResetColor,).unwrap();
+                // Application de la coloration syntaxique
+                let regions = h.highlight_line(line, ps).unwrap_or_default();
+                let mut current_width = 0;
+
+                for (style, text) in regions {
+                    let fg = Color::Rgb {
+                        r: style.foreground.r,
+                        g: style.foreground.g,
+                        b: style.foreground.b,
+                    };
+
+                    let text_chars = text.chars().count();
+
+                    if current_width + text_chars > preview_max_width {
+                        let allowed = preview_max_width.saturating_sub(current_width + 1);
+                        if allowed > 0 {
+                            let trunc: String = text.chars().take(allowed).collect();
+                            queue!(stdout, SetForegroundColor(fg), Print(trunc)).unwrap();
+                        }
+                        // Troncature visuelle
+                        queue!(stdout, SetForegroundColor(Color::DarkGrey), Print("…")).unwrap();
+                        break;
+                    } else {
+                        queue!(stdout, SetForegroundColor(fg), Print(text)).unwrap();
+                        current_width += text_chars;
+                    }
+                }
+
+                // On s'assure que la fin de la ligne est nettoyée et que la couleur est réinitialisée
+                queue!(stdout, Clear(ClearType::UntilNewLine), ResetColor).unwrap();
                 y += 1;
             }
 
-            // --- CORRECTION : Nettoyage des lignes fantômes ---
             while y < rows {
-                queue!(stdout, cursor::MoveTo(col3_x + 2, y)).unwrap();
+                queue!(
+                    stdout,
+                    cursor::MoveTo(col3_x + 2, y),
+                    Clear(ClearType::UntilNewLine)
+                )
+                .unwrap();
                 y += 1;
             }
         }
@@ -299,7 +349,6 @@ pub fn draw_ui(workspace: &mut Workspace) {
         input_buffer,
     } = &workspace.mode
     {
-        // On se place sur la toute dernière ligne en bas de l'écran
         queue!(stdout, MoveTo(0, rows.saturating_sub(1))).unwrap();
         queue!(
             stdout,
@@ -312,6 +361,5 @@ pub fn draw_ui(workspace: &mut Workspace) {
         )
         .unwrap();
     }
-    // Pousse tout le rendu vers le terminal en un seul coup (Mushin pur)
     stdout.flush().unwrap();
 }
