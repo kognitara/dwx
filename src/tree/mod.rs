@@ -68,10 +68,11 @@ impl MillerState {
         state
     }
     pub fn rename(&mut self, a: PathBuf, b: String) {
-        let mut target_path = self.current_dir.clone();
-        target_path.push(b.clone());
-
-        let _ = fs::rename(a, target_path);
+        if !self.current_dir.starts_with(&a) {
+            let mut target_path = self.current_dir.clone();
+            target_path.push(b.clone());
+            let _ = fs::rename(a, target_path);
+        }
         self.refresh();
     }
     pub fn filter(&mut self, query: &str) {
