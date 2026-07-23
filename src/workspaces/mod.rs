@@ -63,8 +63,8 @@ impl Workspace {
 
                         // Le moteur de recherche magique (respecte les .gitignore)
                         let walker = WalkBuilder::new(dir)
-                            .threads(4)
                             .standard_filters(true)
+                            .threads(4)
                             .add_custom_ignore_filename(".awqignore")
                             .build();
 

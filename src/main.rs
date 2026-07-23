@@ -20,12 +20,16 @@ use workspaces::{AppMode, Workspace};
 use crate::tree::FileItem;
 
 fn load(workspace: &mut Workspace) -> FileItem {
-    workspace
-        .miller
-        .current_entries
-        .get(workspace.miller.selected_index)
-        .expect("no file")
-        .clone()
+    if !workspace.miller.current_entries.is_empty() {
+        workspace
+            .miller
+            .current_entries
+            .get(workspace.miller.selected_index)
+            .expect("no file")
+            .clone()
+    } else {
+        FileItem::default()
+    }
 }
 
 fn main() -> io::Result<()> {

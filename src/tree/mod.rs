@@ -10,7 +10,7 @@ pub struct DirState {
     pub scroll_offset: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct FileItem {
     pub path: PathBuf,
     pub name: String,
