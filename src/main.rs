@@ -20,7 +20,8 @@ use workspaces::{AppMode, Workspace};
 use crate::tree::FileItem;
 
 fn load(workspace: &mut Workspace) -> FileItem {
-    if !workspace.miller.current_entries.is_empty() {
+    if !workspace.miller.current_entries.is_empty() && !workspace.miller.filtered_indices.is_empty()
+    {
         workspace
             .miller
             .current_entries
@@ -221,6 +222,7 @@ fn main() -> io::Result<()> {
                                 workspace
                                     .miller
                                     .rename(current_file_item.name, input_buffer.to_string());
+                                workspace.miller.refresh();
                             }
                             workspace.mode = AppMode::Normal;
                         }
