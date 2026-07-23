@@ -10,7 +10,7 @@ use crossterm::{
 use std::io::{Write, stdout};
 use std::sync::OnceLock;
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Style as SyntectStyle, ThemeSet};
+use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 
 pub fn draw_ui(workspace: &mut Workspace) {
@@ -153,19 +153,13 @@ pub fn draw_ui(workspace: &mut Workspace) {
 
             let is_selected = loop_idx == workspace.miller.selected_index;
 
-            let display_name = if item.is_dir {
-                format!("{}/", item.name)
-            } else {
-                item.name.clone()
-            };
-
             if is_selected {
                 queue!(
                     stdout,
                     SetAttribute(crossterm::style::Attribute::Bold),
                     SetBackgroundColor(Color::Black),
                     SetForegroundColor(Color::Red),
-                    Print(format!("> {} {}", icon.icon, display_name)),
+                    Print(format!("> {} {}", icon.icon, item.name)),
                     ResetColor,
                 )
                 .unwrap();
@@ -184,7 +178,7 @@ pub fn draw_ui(workspace: &mut Workspace) {
                     SetAttribute(crossterm::style::Attribute::Bold),
                     SetBackgroundColor(Color::Black),
                     SetForegroundColor(color),
-                    Print(format!("  {} {}", icon.icon, display_name)),
+                    Print(format!("  {} {}", icon.icon, item.name)),
                     ResetColor,
                 )
                 .unwrap();
@@ -277,14 +271,11 @@ pub fn draw_ui(workspace: &mut Workspace) {
                 .miller
                 .filtered_indices
                 .get(workspace.miller.selected_index)
+                && let Some(item) = workspace.miller.current_entries.get(actual_item_idx)
+                && let Some(ext) = item.path.extension().and_then(|s| s.to_str())
+                && let Some(found_syntax) = ps.find_syntax_by_extension(ext)
             {
-                if let Some(item) = workspace.miller.current_entries.get(actual_item_idx) {
-                    if let Some(ext) = item.path.extension().and_then(|s| s.to_str()) {
-                        if let Some(found_syntax) = ps.find_syntax_by_extension(ext) {
-                            syntax = found_syntax;
-                        }
-                    }
-                }
+                syntax = found_syntax;
             }
 
             let mut h = HighlightLines::new(syntax, theme);

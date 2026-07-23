@@ -42,7 +42,7 @@ impl FileItem {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct MillerState {
     pub current_dir: PathBuf,
     pub filtered_indices: Vec<usize>,
@@ -51,20 +51,6 @@ pub struct MillerState {
     pub history: HashMap<PathBuf, DirState>,
     pub selected_index: usize,
     pub scroll_offset: usize,
-}
-
-impl Default for MillerState {
-    fn default() -> Self {
-        Self {
-            current_dir: Default::default(),
-            filtered_indices: Default::default(),
-            parent_entries: Default::default(),
-            current_entries: Default::default(),
-            history: Default::default(),
-            selected_index: Default::default(),
-            scroll_offset: Default::default(),
-        }
-    }
 }
 
 impl MillerState {
@@ -80,6 +66,10 @@ impl MillerState {
         };
         state.refresh();
         state
+    }
+    pub fn rename(&mut self, a: String, b: String) {
+        let _ = fs::rename(a, b);
+        self.refresh();
     }
     pub fn filter(&mut self, query: &str) {
         if query.is_empty() {
@@ -124,28 +114,27 @@ impl MillerState {
     }
 
     pub fn enter_dir(&mut self) {
-        if let Some(&actual_index) = self.filtered_indices.get(self.selected_index) {
-            if let Some(selected) = self.current_entries.get(actual_index) {
-                if selected.path.is_dir() {
-                    self.history.insert(
-                        self.current_dir.clone(),
-                        DirState {
-                            selected_index: self.selected_index,
-                            scroll_offset: self.scroll_offset,
-                        },
-                    );
-                    self.current_dir = selected.path.clone();
+        if let Some(&actual_index) = self.filtered_indices.get(self.selected_index)
+            && let Some(selected) = self.current_entries.get(actual_index)
+            && selected.path.is_dir()
+        {
+            self.history.insert(
+                self.current_dir.clone(),
+                DirState {
+                    selected_index: self.selected_index,
+                    scroll_offset: self.scroll_offset,
+                },
+            );
+            self.current_dir = selected.path.clone();
 
-                    if let Some(saved_state) = self.history.get(&self.current_dir) {
-                        self.selected_index = saved_state.selected_index;
-                        self.scroll_offset = saved_state.scroll_offset;
-                    } else {
-                        self.selected_index = 0;
-                        self.scroll_offset = 0;
-                    }
-                    self.refresh();
-                }
+            if let Some(saved_state) = self.history.get(&self.current_dir) {
+                self.selected_index = saved_state.selected_index;
+                self.scroll_offset = saved_state.scroll_offset;
+            } else {
+                self.selected_index = 0;
+                self.scroll_offset = 0;
             }
+            self.refresh();
         }
     }
 
@@ -189,7 +178,6 @@ impl MillerState {
         } else {
             self.parent_entries.clear();
         }
-
         // On réinitialise le filtre
         self.filtered_indices = (0..self.current_entries.len()).collect();
     }

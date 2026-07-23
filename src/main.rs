@@ -6,7 +6,8 @@ use crossterm::{
         Clear, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     },
 };
-use std::io::{self, stdout};
+use std::io;
+use std::io::stdout;
 use std::time::Duration;
 
 pub mod bus;
@@ -15,6 +16,17 @@ pub mod tree; // Ton nouveau MillerState tout propre
 pub mod ui;
 pub mod workspaces; // Ton Workspace // Là où tu as ta fonction draw_ui
 use workspaces::{AppMode, Workspace};
+
+use crate::tree::FileItem;
+
+fn load(workspace: &mut Workspace) -> FileItem {
+    workspace
+        .miller
+        .current_entries
+        .get(workspace.miller.selected_index)
+        .expect("no file")
+        .clone()
+}
 
 fn main() -> io::Result<()> {
     // 1. Initialisation du Terminal
@@ -30,6 +42,8 @@ fn main() -> io::Result<()> {
     loop {
         // A. On dépile les messages des threads en arrière-plan
         workspace.poll_bus();
+
+        let current_file_item = load(&mut workspace);
 
         // B. On dessine l'interface
         ui::draw_ui(&mut workspace);
@@ -47,15 +61,16 @@ fn main() -> io::Result<()> {
                 workspace.pending_g = false;
                 let target_dir = match key.code {
                     KeyCode::Char('h') => dirs::home_dir(),
-                    KeyCode::Char('D') => dirs::download_dir(),
+                    KeyCode::Char('x') => dirs::download_dir(),
                     KeyCode::Char('d') => dirs::document_dir(),
-                    KeyCode::Char('a') => dirs::audio_dir(),
+                    KeyCode::Char('m') => dirs::audio_dir(),
                     KeyCode::Char('b') => dirs::executable_dir(),
                     KeyCode::Char('c') => dirs::config_dir(),
                     KeyCode::Char('p') => dirs::picture_dir(),
                     KeyCode::Char('v') => dirs::video_dir(),
                     KeyCode::Char('f') => dirs::font_dir(),
                     KeyCode::Char('t') => dirs::template_dir(),
+                    KeyCode::Char('j') => dirs::desktop_dir(),
                     KeyCode::Char('r') => Some(std::path::PathBuf::from("/")),
                     _ => None, // Si on tape une autre touche, on annule l'action
                 };
@@ -72,6 +87,16 @@ fn main() -> io::Result<()> {
             match workspace.mode {
                 AppMode::Normal => {
                     match key.code {
+                        KeyCode::F(2) => {
+                            if current_file_item.path.is_file() {
+                                workspace.mode = AppMode::Omnibar {
+                                    prefix: '*',
+                                    input_buffer: current_file_item.name,
+                                };
+                            } else {
+                                continue;
+                            }
+                        }
                         KeyCode::Char('/') => {
                             workspace.mode = AppMode::Omnibar {
                                 prefix: '/',
@@ -97,16 +122,12 @@ fn main() -> io::Result<()> {
                             };
                         }
                         KeyCode::Enter => {
-                            let file = workspace
-                                .miller
-                                .current_entries
-                                .get(workspace.miller.selected_index)
-                                .expect("no file");
-                            if !file.path.is_file() {
+                            if !current_file_item.path.is_file() {
                                 continue;
                             }
                             queue!(stdout, Hide, LeaveAlternateScreen).expect("failed");
-                            editor::view_file_with_scroll(file.path.as_path()).expect("failed");
+                            editor::view_file_with_scroll(current_file_item.path.as_path())
+                                .expect("failed");
                             queue!(
                                 stdout,
                                 Hide,
@@ -179,16 +200,24 @@ fn main() -> io::Result<()> {
                     match key.code {
                         // Quitter la barre avec Échap
                         KeyCode::Esc => {
+                            queue!(stdout, Clear(crossterm::terminal::ClearType::All)).unwrap();
                             workspace.mode = AppMode::Normal;
                             if prefix == '/' {
                                 workspace.miller.filter("");
                                 workspace.update_preview();
+                            } else if prefix == '*' {
+                                workspace.miller.refresh();
                             }
                         }
 
                         // Valider la recherche
                         KeyCode::Enter => {
                             queue!(stdout, Clear(crossterm::terminal::ClearType::All)).unwrap();
+                            if prefix == '*' && current_file_item.path.is_file() {
+                                workspace
+                                    .miller
+                                    .rename(current_file_item.name, input_buffer.to_string());
+                            }
                             workspace.mode = AppMode::Normal;
                         }
                         // Effacer un caractère
