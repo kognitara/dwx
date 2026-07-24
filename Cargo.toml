@@ -1,16 +1,14 @@
 [package]
 name = "dwx"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Data Walk eXtended"
 license = "AGPL-3.0-or-later"
 readme = "README.md"
 
 [dependencies]
-anyhow = "1.0.104"
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 blake3 = "1.8.5"
-clap = { version = "4.6.2", features = ["derive"] }
 crossterm = { version = "0.29", features = [
     "events",
     "use-dev-tty",
@@ -19,8 +17,7 @@ crossterm = { version = "0.29", features = [
 devicons = "0.6.12"
 dirs = "6.0.0"
 flate2 = "1.1.9"
-human-units = "0.5.4"
-ignore = "0.4.30"
+ignore = "0.4.31"
 is_executable = "1.0.6"
 regex = "1.13.1"
 similar = "3.1.1"

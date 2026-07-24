@@ -15,4 +15,8 @@ pub enum InspectorCommand {
         dir: PathBuf,
         search_id: usize,
     },
+    MountSshfs {
+        connection_string: String, // ex: "user@host:/chemin/distant"
+        mount_point: PathBuf,      // ex: "/tmp/dwx_ssh_mnt"
+    },
 }

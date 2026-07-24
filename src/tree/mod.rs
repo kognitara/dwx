@@ -45,6 +45,7 @@ impl FileItem {
 #[derive(Clone, Default)]
 pub struct MillerState {
     pub current_dir: PathBuf,
+    pub new_file: PathBuf,
     pub filtered_indices: Vec<usize>,
     pub parent_entries: Vec<FileItem>,
     pub current_entries: Vec<FileItem>,
@@ -57,6 +58,7 @@ impl MillerState {
     pub fn new(start_dir: PathBuf) -> Self {
         let mut state = Self {
             current_dir: start_dir,
+            new_file: PathBuf::new(),
             parent_entries: Vec::new(),
             current_entries: Vec::new(),
             selected_index: 0,
@@ -90,13 +92,13 @@ impl MillerState {
                 .map(|(i, _)| i)
                 .collect();
         }
-
         // Sécurité : on remet le curseur en haut pour ne pas pointer dans le vide
         self.selected_index = 0;
         self.scroll_offset = 0;
     }
-    pub fn set_dir(&mut self, new_dir: PathBuf) {
-        self.current_dir = new_dir;
+
+    pub fn set_dir(&mut self, new_dir: &Path) {
+        self.current_dir = new_dir.to_path_buf();
         // On n'oublie pas de remonter la caméra tout en haut
         self.selected_index = 0;
         self.scroll_offset = 0;

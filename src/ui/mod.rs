@@ -154,12 +154,21 @@ pub fn draw_ui(workspace: &mut Workspace) {
             let is_selected = loop_idx == workspace.miller.selected_index;
 
             if is_selected {
+                // On détecte l'archive ET notre nouveau drapeau
+                let is_loading =
+                    item.name.ends_with(".tar.gz") && matches!(workspace.preview, Preview::Empty);
+                // 2. On change le curseur et sa couleur selon l'état
+                let (cursor_char, cursor_color) = if is_loading {
+                    ("~", Color::Yellow) // Curseur "chargement" (un tilde jaune qui ressort bien sur fond sombre)
+                } else {
+                    (">", Color::Red) // Curseur classique
+                };
                 queue!(
                     stdout,
                     SetAttribute(crossterm::style::Attribute::Bold),
                     SetBackgroundColor(Color::Black),
-                    SetForegroundColor(Color::Red),
-                    Print(format!("> {} {}", icon.icon, item.name)),
+                    SetForegroundColor(cursor_color),
+                    Print(format!("{cursor_char} {} {}", icon.icon, item.name)),
                     ResetColor,
                 )
                 .unwrap();
@@ -329,7 +338,17 @@ pub fn draw_ui(workspace: &mut Workspace) {
                 y += 1;
             }
         }
-        Preview::Empty => {}
+        Preview::Empty => {
+            while y < rows {
+                queue!(
+                    stdout,
+                    cursor::MoveTo(col3_x + 2, y),
+                    Clear(ClearType::UntilNewLine)
+                )
+                .unwrap();
+                y += 1;
+            }
+        }
     }
 
     // ---------------------------------------------------------

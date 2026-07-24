@@ -6,18 +6,18 @@ use crossterm::{
         Clear, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     },
 };
-use std::io;
-use std::io::stdout;
-use std::time::Duration;
 
+use std::time::Duration;
+use std::{fs::File, io::stdout};
+use std::{fs::create_dir_all, io};
+pub mod actions;
 pub mod bus;
 pub mod editor;
 pub mod tree; // Ton nouveau MillerState tout propre
 pub mod ui;
 pub mod workspaces; // Ton Workspace // Là où tu as ta fonction draw_ui
+use crate::{actions::create_tar_gz_archive, tree::FileItem};
 use workspaces::{AppMode, Workspace};
-
-use crate::tree::FileItem;
 
 fn load(workspace: &mut Workspace) -> FileItem {
     if !workspace.miller.current_entries.is_empty() && !workspace.miller.filtered_indices.is_empty()
@@ -68,7 +68,7 @@ fn main() -> io::Result<()> {
                     KeyCode::Char('h') => dirs::home_dir(),
                     KeyCode::Char('x') => dirs::download_dir(),
                     KeyCode::Char('d') => dirs::document_dir(),
-                    KeyCode::Char('m') => dirs::audio_dir(),
+                    KeyCode::Char('a') => dirs::audio_dir(),
                     KeyCode::Char('b') => dirs::executable_dir(),
                     KeyCode::Char('c') => dirs::config_dir(),
                     KeyCode::Char('p') => dirs::picture_dir(),
@@ -83,7 +83,7 @@ fn main() -> io::Result<()> {
                 if let Some(new_dir) = target_dir {
                     // Si le dossier existe, on s'y téléporte !
                     if new_dir.exists() && new_dir.is_dir() {
-                        workspace.miller.set_dir(new_dir);
+                        workspace.miller.set_dir(&new_dir);
                         queue!(stdout, Clear(crossterm::terminal::ClearType::All)).unwrap();
                     }
                 }
@@ -104,13 +104,23 @@ fn main() -> io::Result<()> {
                                 input_buffer: String::new(),
                             };
                         }
-                        KeyCode::Char('f') => {
+                        KeyCode::Char('f') if workspace.pending_create => {
+                            workspace.pending_create = false;
+                            workspace.pending_g = false;
+                            workspace.pending_create_dir = false;
+                            workspace.pending_create_file = true;
+                            workspace.pending_create_archive = false;
                             workspace.mode = AppMode::Omnibar {
                                 prefix: '+',
                                 input_buffer: String::new(),
                             };
                         }
-                        KeyCode::Char('a') => {
+                        KeyCode::Char('a') if workspace.pending_create => {
+                            workspace.pending_create = false;
+                            workspace.pending_g = false;
+                            workspace.pending_create_dir = false;
+                            workspace.pending_create_file = false;
+                            workspace.pending_create_archive = true;
                             workspace.mode = AppMode::Omnibar {
                                 prefix: '+',
                                 input_buffer: String::new(),
@@ -137,12 +147,6 @@ fn main() -> io::Result<()> {
                             )
                             .expect("failed");
                             continue;
-                        }
-                        KeyCode::Char('h') => {
-                            workspace.mode = AppMode::Omnibar {
-                                prefix: '#',
-                                input_buffer: String::new(),
-                            };
                         }
                         KeyCode::Char('?') => {
                             workspace.mode = AppMode::Omnibar {
@@ -175,7 +179,10 @@ fn main() -> io::Result<()> {
                         }
                         KeyCode::Char('d') if workspace.pending_create => {
                             workspace.pending_create = false;
+                            workspace.pending_g = false;
                             workspace.pending_create_dir = true;
+                            workspace.pending_create_file = false;
+                            workspace.pending_create_archive = false;
                             workspace.mode = AppMode::Omnibar {
                                 prefix: '+',
                                 input_buffer: String::new(),
@@ -191,6 +198,8 @@ fn main() -> io::Result<()> {
                             // Si on tape une touche non reconnue, on annule les actions en cours
                             workspace.pending_create = false;
                             workspace.pending_g = false;
+                            workspace.pending_create_dir = false;
+                            workspace.pending_create_file = false;
                         }
                     }
                 }
@@ -198,6 +207,7 @@ fn main() -> io::Result<()> {
                     prefix,
                     ref mut input_buffer,
                 } => {
+                    let new_filename = workspace.miller.current_dir.join(input_buffer.clone());
                     match key.code {
                         // Quitter la barre avec Échap
                         KeyCode::Esc => {
@@ -210,8 +220,6 @@ fn main() -> io::Result<()> {
                                 workspace.miller.refresh();
                             }
                         }
-
-                        // Valider la recherche
                         KeyCode::Enter => {
                             queue!(stdout, Clear(crossterm::terminal::ClearType::All)).unwrap();
                             if prefix == '*' {
@@ -219,9 +227,19 @@ fn main() -> io::Result<()> {
                                     current_file_item.path.clone(),
                                     input_buffer.to_string(),
                                 );
-                                workspace.miller.refresh();
+                            } else if prefix == '+' && workspace.pending_create_dir {
+                                workspace.pending_create_dir = false;
+                                let _ = create_dir_all(new_filename);
+                            } else if prefix == '+' && workspace.pending_create_file {
+                                workspace.pending_create_file = false;
+                                let f = File::create(new_filename).unwrap();
+                                f.sync_data().expect("v");
+                            } else if prefix == '+' && workspace.pending_create_archive {
+                                let name = input_buffer.trim().to_string();
+                                let _ = create_tar_gz_archive(&mut workspace, name);
                             }
                             workspace.mode = AppMode::Normal;
+                            workspace.miller.refresh();
                         }
                         // Effacer un caractère
                         KeyCode::Backspace => {

@@ -1,3 +1,4 @@
 /target
 .awq/
 LICENSE.1
+*.tar.gz
